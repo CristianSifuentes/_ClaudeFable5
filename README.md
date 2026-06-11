@@ -61,6 +61,40 @@ Platzi Learn is designed to be used only where it genuinely adds value — momen
 
 ## 2. Technical Architecture: How Claude Fable 5 Works Under the Hood
 
+### Proof Point: The Stripe Migration
+
+Before the architecture, a real-world result that defines what this model is.
+
+A team of engineers at Stripe had a **50-million-line Ruby migration** on their roadmap. Human estimate: more than two months of engineering work. Claude Fable 5 completed it in a single day.
+
+That is not an incremental improvement over Opus 4.8. It is a categorical shift in what you can delegate.
+
+### Agentic vs. Assistant: The Fundamental Distinction
+
+Every previous Claude model — including Opus 4.8 — was an **assistant model**: you ask a question, it answers; you give a task, it completes the next step; you need more, you ask again. The human is the loop.
+
+Claude Fable 5 is an **agentic model**: you hand it a project with a goal and it returns a completed result. The model is the loop.
+
+```
+Assistant model (Opus 4.8 and earlier)
+──────────────────────────────────────
+Human: "Do step 1"
+Model: [does step 1]
+Human: "Now do step 2"
+Model: [does step 2]
+Human: "Step 3 needs a different approach, here's context..."
+Model: [does step 3]
+→ Human drives every step
+
+Agentic model (Fable 5)
+──────────────────────────────────────
+Human: "Here is the goal and the constraints."
+Model: [step 1 → evaluates result → step 2 → adjusts → step 3 → ... → final output]
+→ Model drives execution; human reviews the result
+```
+
+This distinction explains the Stripe migration. An assistant model would have required a human to approve every file change, review every test, and unblock every ambiguity. An agentic model reads the codebase, forms a migration plan, executes it, runs the test suite, and iterates until the suite passes — without a human in the middle.
+
 ### The Transformer Foundation (and What Changed)
 
 Claude Fable 5 builds on the dense transformer architecture Anthropic has refined across the Claude 3 and Claude 4 families, with significant changes in three areas:
@@ -144,6 +178,8 @@ This loop can repeat multiple times within one API call, enabling autonomous mul
 - **Reduced "sycophancy"** — The model pushes back more reliably when given incorrect premises.
 - **Better code editing vs. code generation** — Prior models excelled at generating code from scratch; Fable 5 shows significant improvement in editing, refactoring, and migrating existing codebases.
 - **Multi-modal reasoning** — Enhanced image understanding integrated tighter with text reasoning chains.
+- **Native visual processing without plugins** — Fable 5 can interact with graphical interfaces, dashboards, and forms using only what it sees on screen. Where previous workflows required plugins or custom scrapers to pass UI state to the model, Fable 5 reads it directly. This simplifies any flow where the model must interpret visual data: charts, web interfaces, PDFs, screenshots.
+- **Token efficiency** — Fable 5 produces measurably better results while consuming approximately **half the tokens of Opus 4.8** for equivalent tasks. Think of it as a precision instrument: rather than disassembling the whole structure to find the problem, it places the exact beam needed.
 
 ---
 
@@ -275,6 +311,36 @@ Phase 3: Bedrock / GCP Vertex AI — cloud provider availability
 
 If you are evaluating whether to build on Fable 5, assume Phase 1 availability with Phase 2 arriving on a defined date. **Do not architect a production system on subscriber-only access.**
 
+### Plan-Specific Access Rules
+
+Access to Fable 5 is not uniform across plans. The rules differ significantly depending on how you pay.
+
+| Plan Type | Access Model | Notes |
+|---|---|---|
+| **API** | Full access, pay per token | No additional restrictions; cost scales with usage |
+| **Enterprise (consumption-based)** | Full access, pay per token | Same as API — no caps |
+| **Pro / Max / Team (subscription)** | Requires additional credits after June 23 | See credit burn rates below |
+
+**Subscription plan detail:** After June 23, using Fable 5 on Pro, Max, or Team plans requires purchasing credits on top of your subscription fee. Anthropic plans to reintegrate Fable 5 as a standard subscription feature once compute capacity scales, but there is no committed date.
+
+Analogy: a streaming service that gives you free access to a premium channel for two weeks and then charges extra. Plan your budget accordingly.
+
+### Credit Burn Rates on Subscription Plans
+
+Agentic use is orders of magnitude more token-intensive than conversational use. The model runs multiple internal reasoning steps, tool calls, and self-corrections per task — all of which consume credits.
+
+```
+Plan: Max ($100/month)
+Standard allocation: ~6 hours of usage per cycle
+
+Real-world result with intensive agentic workflows:
+→ Entire 6-hour allocation exhausted in 20 minutes
+```
+
+This is not an edge case. Any workflow that involves multi-file editing, autonomous research, or tool-calling loops will trigger this burn rate.
+
+**Before committing to a subscription plan for agentic work, run one representative task and measure actual credit consumption.** Then extrapolate to your monthly volume. API/Enterprise pricing is almost always more cost-predictable at scale.
+
 ### Token Pricing Model
 
 Anthropic prices all Claude models on a per-token basis, split between input and output:
@@ -393,7 +459,46 @@ claude --continue
 
 # Run in non-interactive mode (CI/CD pipelines)
 claude --print "Generate a changelog from git log since v1.2.0"
+
+# Explicitly request Claude Fable 5 (terminal)
+claude --model claude-fable-5
 ```
+
+### Verifying You Are Actually Running Claude Fable 5
+
+Subscription plans can silently route you to a different model. Do not assume — verify.
+
+**Terminal (Claude Code CLI):**
+```bash
+claude --model claude-fable-5
+```
+
+**Web interface or desktop app:**
+```
+/model fable
+```
+Type this command inside any chat session to switch to and confirm Fable 5.
+
+**The most reliable signal — the fallback message:**
+
+```
+Signal                               What it means
+────────────────────────────────────────────────────────────────
+No fallback message appears        → You are on Fable 5 right now
+"Switching to Opus 4.8" appears    → You WERE on Fable 5; task
+                                     triggered the automatic safety
+                                     boundary and downgraded
+────────────────────────────────────────────────────────────────
+```
+
+The automatic fallback to Opus 4.8 occurs in fewer than **5% of sessions**. If you see it frequently, your task type is consistently hitting a safety boundary — that is information about your use case, not a model defect.
+
+**Three questions to answer before every session:**
+1. What plan are you on — API, Enterprise, Pro, Max, or Team?
+2. Did you confirm Fable 5 is active with `--model claude-fable-5` or `/model fable`?
+3. How much credit/allocation do you have left for this billing cycle?
+
+Answer all three before starting any agentic task. Intensive workflows can exhaust subscription allocations in minutes.
 
 ### CLAUDE.md: Your Project's AI Constitution
 
@@ -537,8 +642,52 @@ Claude Haiku 3.5   ── Fast, cheap, small tasks
 Claude Sonnet 4.5  ── Balanced: most tasks, daily driver
 Claude Opus 4      ── Deep reasoning, complex analysis
 Claude Opus 4.8    ── Fallback target from Fable 5
-Claude Fable 5     ── Flagship: maximum capability
+Claude Fable 5     ── Flagship: maximum capability, agentic
 ```
+
+### Benchmark Data: Fable 5 vs Opus 4.8
+
+These are measured results from independent evaluations, not marketing claims.
+
+#### FrontierCode: Production-Ready Code Quality
+
+FrontierCode measures whether generated code meets production standards — not just whether it runs, but whether it handles edge cases, follows conventions, and could be shipped without manual revision.
+
+```
+FrontierCode Benchmark
+──────────────────────────────────────────
+Claude Fable 5    46.3%   ████████████████████░░░░░░░░░░░░░░
+Claude Opus 4.8   34.3%   ███████████████░░░░░░░░░░░░░░░░░░░
+──────────────────────────────────────────
+Delta:           +12.0pp
+```
+
+A 12-percentage-point gap in production-ready code changes the delegation threshold. Tasks you previously had to review line-by-line can now be shipped with a lighter review pass.
+
+#### Financial Work: Real-World Analytical Quality
+
+Evaluators with real financial modeling experience compared outputs head-to-head across tasks including building financial models, running valuations, and preparing client-facing analysis.
+
+```
+Head-to-head preference: Fable 5 vs Opus 4.8
+──────────────────────────────────────────
+Fable 5 preferred:    74% of direct comparisons
+Opus 4.8 preferred:   26% of direct comparisons
+```
+
+This is a measure of analytical quality by domain experts, not a synthetic benchmark — which makes it more relevant for finance, strategy, and research use cases.
+
+#### Token Efficiency: More Output, Half the Cost
+
+```
+Same task class, measured token consumption:
+──────────────────────────────────────────
+Opus 4.8:    baseline token consumption
+Fable 5:     ~50% of Opus 4.8 tokens for equivalent or better results
+──────────────────────────────────────────
+```
+
+The efficiency gain is structural. The model reaches the correct solution through a more precise reasoning path rather than exploring and discarding more intermediate steps.
 
 ### Capability Matrix
 
@@ -820,18 +969,46 @@ Reliability
 
 ```bash
 # Claude Code essentials
-claude                          # Start interactive session
-claude -p "task"                # One-shot task
-claude --continue               # Resume last session
-claude --print "task"           # Non-interactive output
+claude                               # Start interactive session
+claude -p "task"                     # One-shot task
+claude --continue                    # Resume last session
+claude --print "task"                # Non-interactive output
+claude --model claude-fable-5        # Explicitly request Fable 5
 
+# Verify active model (inside chat)
+/model fable                         # Web / desktop app
+```
+
+```python
+# Always verify which model actually ran (API)
+print(response.model)                # May differ from requested model
+print(response.usage.input_tokens)   # Cost visibility: input
+print(response.usage.output_tokens)  # Cost visibility: output
+```
+
+```
+# Fallback signal interpretation
+No "switching to Opus 4.8" message  →  You are on Fable 5
+"Switching to Opus 4.8" appears     →  Safety boundary triggered (< 5% of sessions)
+
+# Plan access summary (post June 23)
+API / Enterprise                    →  Full access, pay per token
+Pro / Max / Team subscription       →  Additional credits required
+Max plan ($100) agentic burn rate   →  6-hour allocation in ~20 minutes
+
+# FrontierCode benchmark
+Fable 5:   46.3%  (+12pp vs Opus 4.8)
+Opus 4.8:  34.3%
+
+# Financial work preference (head-to-head)
+Fable 5 preferred: 74% of evaluations
+Token efficiency:  ~50% of Opus 4.8 token consumption for equivalent results
+```
+
+```bash
 # Useful environment variables
-ANTHROPIC_API_KEY=sk-ant-...    # Required for API access
-CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192   # Override default output limit
-
-# Check which model ran (Python)
-print(response.model)           # May differ from what you requested
-print(response.usage)           # Always log this
+ANTHROPIC_API_KEY=sk-ant-...              # Required for API access
+CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192        # Override default output limit
 ```
 
 ---
