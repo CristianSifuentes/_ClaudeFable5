@@ -660,6 +660,63 @@ task on Fable 5 run multiple times with retries.
 
 The token efficiency advantage (~50% fewer tokens for equivalent results) partially offsets this multiplier. But the net effect for most workloads is still a higher per-task cost compared to Opus 4.8. This means you need to be deliberate: **use Fable 5 for tasks that are large, bounded, and verifiable** — not for tasks where Sonnet 4.5 or Opus 4 would do.
 
+### API Parameters That Produce 400 Errors in Fable 5
+
+This is the highest-frequency breaking change when migrating from Opus 4.8 or earlier models. The minimum valid payload for Fable 5 has three required fields and three forbidden ones.
+
+```python
+# Minimum valid payload — nothing more, nothing less required
+{
+    "model": "claude-fable-5",
+    "max_tokens": 128000,
+    "messages": [{"role": "user", "content": "your message"}]
+}
+```
+
+**Parameters that produce HTTP 400 if included:**
+
+```
+Parameter                 Why it fails
+────────────────────────────────────────────────────────────────────
+thinking: {type: "disabled"}   Thinking is ALWAYS active in Fable 5.
+                                You cannot disable it. Sending disabled
+                                returns 400 immediately.
+
+temperature                    Not supported. Fable 5 manages its own
+                                sampling internally. Including this field,
+                                even as null, returns 400.
+
+top_p                          Same — not supported, returns 400.
+
+top_k                          Same — not supported, returns 400.
+
+Assistant prefill              Pre-filling the assistant turn is blocked.
+(messages[-1].role = "assistant")  Not allowed in Fable 5 requests.
+────────────────────────────────────────────────────────────────────
+```
+
+If your existing code sets any of these — even with default or null values — it will fail against Fable 5 without a model-specific error message. The 400 just says "invalid request."
+
+```python
+# Migration check: scan for forbidden parameters before deploying
+FABLE5_FORBIDDEN = {"temperature", "top_p", "top_k"}
+
+def validate_fable5_payload(payload: dict) -> list[str]:
+    errors = []
+    for key in FABLE5_FORBIDDEN:
+        if key in payload:
+            errors.append(f"Remove '{key}' — not supported in Fable 5")
+    thinking = payload.get("thinking", {})
+    if thinking.get("type") == "disabled":
+        errors.append("thinking.type='disabled' is invalid — thinking is always active")
+    messages = payload.get("messages", [])
+    if messages and messages[-1].get("role") == "assistant":
+        errors.append("Assistant prefill not allowed in Fable 5")
+    return errors
+```
+
+Run this validator against your existing request builders before switching `model` to `claude-fable-5`.
+
 ### The Expensive Mistakes (and How to Avoid Them)
 
 | Mistake | Cost Impact | Fix |
@@ -967,6 +1024,98 @@ messages = [
 ]
 ```
 
+### Model Selection Priority in Claude Code
+
+Claude Code resolves which model to use by applying four mechanisms in order. Think of them as layers of paint — the top layer always wins, regardless of what is underneath.
+
+```
+Priority  Mechanism                          How to set
+────────────────────────────────────────────────────────────
+1 (wins)  /model command during session      Type /model fable in chat
+2         --model flag at startup            claude --model claude-fable-5
+3         ANTHROPIC_MODEL env variable       export ANTHROPIC_MODEL=claude-fable-5
+4 (loses) model field in settings file       .claude/settings.json or CLAUDE.md
+────────────────────────────────────────────────────────────
+```
+
+The insidious problem: if someone on your team ran `/model` three weeks ago and pressed Enter (permanent save), that persists across all their sessions and silently overrides everything — including your project's settings file. Your repository config says Fable 5; they are getting something else; nothing reports an error.
+
+**Team tip — the `best` alias:**
+
+Instead of hardcoding a model name in your project settings file, use the `best` alias:
+
+```json
+// .claude/settings.json
+{
+  "model": "best"
+}
+```
+
+`best` resolves to the most capable model each team member has access to. Engineers with Fable 5 access get Fable 5. Those without fall back to Opus without errors or broken builds. No one needs to manually manage model IDs per environment.
+
+### The Enter vs `s` Key: Persistence Trap in claude.ai and Claude Desktop
+
+When you run `/model fable` inside claude.ai or Claude Desktop, you see a confirmation prompt. What you press next determines scope:
+
+```
+Key pressed    Effect
+────────────────────────────────────────────────────────────
+Enter          Saves Fable 5 as your permanent default.
+               ALL future sessions start on Fable 5.
+               You will not be asked again.
+
+s              Applies the change to this session only.
+               Next session reverts to your previous default.
+────────────────────────────────────────────────────────────
+```
+
+One keypress is a session preference. The other is a permanent account setting that persists until you explicitly change it. This catches nearly everyone the first time.
+
+### Why Your First Request Can Trigger a Fallback Without Sensitive Content
+
+The fallback classifier does not read only your message. It reads your **entire request payload**, which includes:
+
+- The contents of your `CLAUDE.md` file
+- Current git branch name and commit state
+- Your working directory path and name
+
+This means a completely innocent first message can trigger a fallback if the surrounding context looks problematic to the classifier:
+
+```
+Innocent message:  "Summarize the README"
+
+But the payload also contains:
+  - Directory name:  exploit-dev/
+  - CLAUDE.md:       "Project: Red team infrastructure automation"
+  - Branch name:     pentest-phase-2
+
+Result: classifier intercepts, fallback to Opus 4.8
+        Your message is fine. The envelope is not.
+```
+
+The classifier reads the envelope, not just the letter.
+
+### Diagnosing Fallbacks with `--safe-mode`
+
+`--safe-mode` strips all workspace customizations before the request is sent. It removes `CLAUDE.md` content, directory context, and git state from the payload — sending only your message and the system prompt.
+
+Use it as a three-step diagnostic:
+
+```bash
+# Step 1: Run your request with safe-mode
+claude --safe-mode --model claude-fable-5 -p "your original message"
+
+# Step 2: Interpret the result
+If fallback disappears  →  CLAUDE.md or project settings were the trigger
+                           Fix: audit and sanitize your CLAUDE.md content
+
+If fallback persists    →  Run without CLAUDE.md, check directory names
+If fallback still       →  The message itself is triggering the classifier
+  persists                 Fix: rephrase, or evaluate whether Glasswing is appropriate
+```
+
+This saves hours of blind debugging when your integration silently downgrades on every request.
+
 ### Verifying You Are Actually Running Claude Fable 5
 
 Subscription plans can silently route you to a different model. Do not assume — verify.
@@ -980,25 +1129,71 @@ claude --model claude-fable-5
 ```
 /model fable
 ```
-Type this command inside any chat session to switch to and confirm Fable 5.
+Then press **`s`** (not Enter) if you want session-only scope.
 
-**The most reliable signal — the fallback message:**
+**Three signals that together confirm which model responded:**
 
 ```
-Signal                               What it means
-────────────────────────────────────────────────────────────────
-No fallback message appears        → You are on Fable 5 right now
-"Switching to Opus 4.8" appears    → You WERE on Fable 5; task
-                                     triggered the automatic safety
-                                     boundary and downgraded
-────────────────────────────────────────────────────────────────
+Signal 1: response.model
+────────────────────────────────────────────────────────────
+The top-level model field tells you which model served the request.
+
+Signal 2: content[].type == "fallback"
+────────────────────────────────────────────────────────────
+A block of type "fallback" in the content array signals a switch occurred.
+If absent, the named model ran to completion.
+
+Signal 3: usage.iterations (most reliable)
+────────────────────────────────────────────────────────────
+Lists every attempt in the request lifecycle.
+  - Model that declined: output_tokens = 0
+  - Model that responded: appears as fallback_message
+This is the only signal that survives sticky routing (see below).
+────────────────────────────────────────────────────────────
 ```
 
-The automatic fallback to Opus 4.8 occurs in fewer than **5% of sessions**. If you see it frequently, your task type is consistently hitting a safety boundary — that is information about your use case, not a model defect.
+```python
+# Complete response inspection
+response = client.messages.create(...)
+
+# Signal 1 — which model served
+print(f"Served by: {response.model}")
+
+# Signal 2 — explicit fallback block
+fallback_blocks = [b for b in response.content if b.type == "fallback"]
+if fallback_blocks:
+    print("Fallback occurred — check usage.iterations")
+
+# Signal 3 — full attempt history (most reliable)
+if hasattr(response.usage, "iterations"):
+    for i, iteration in enumerate(response.usage.iterations):
+        print(f"  Attempt {i}: model={iteration.model} "
+              f"output_tokens={iteration.output_tokens}")
+```
+
+**Sticky routing — the hidden persistent fallback:**
+
+After a fallback occurs, the system routes **all subsequent turns in the session** to the fallback model for approximately one hour. This routing is silent:
+
+```
+Turn 1:  Fable 5 invoked → safety classifier triggers → falls back to Opus 4.8
+         → response.content includes "fallback" block  ← visible
+
+Turn 2:  [1 hour window active]
+         Routed directly to Opus 4.8 without attempting Fable 5
+         → NO "fallback" block in response.content    ← invisible
+         → response.model says "claude-opus-4-8"
+         → usage.iterations reveals only one attempt  ← looks clean
+
+Turn 10: [still within the hour window]
+         Same invisible routing to Opus 4.8
+```
+
+`usage.iterations` is the only field that reveals sticky routing. If `response.model` is unexpectedly `claude-opus-4-8` and there is no fallback block, check whether a fallback occurred in a previous turn within the last hour.
 
 **Three questions to answer before every session:**
 1. What plan are you on — API, Enterprise, Pro, Max, or Team?
-2. Did you confirm Fable 5 is active with `--model claude-fable-5` or `/model fable`?
+2. Did you confirm Fable 5 is active with `--model claude-fable-5` or `/model fable` + `s`?
 3. How much credit/allocation do you have left for this billing cycle?
 
 Answer all three before starting any agentic task. Intensive workflows can exhaust subscription allocations in minutes.
@@ -1650,6 +1845,34 @@ Input:    $10.00 / million tokens
 Output:   $50.00 / million tokens
 Context:  1,000,000 tokens
 Max out:  128,000 tokens per request
+```
+
+```
+# Model selection priority in Claude Code (highest wins)
+1. /model command in session      ← overrides everything
+2. --model flag at startup
+3. ANTHROPIC_MODEL env variable
+4. model field in settings file   ← lowest priority
+
+# /model fable — key choice
+Enter    →  permanent default (persists all future sessions)
+s        →  session only (reverts next session)
+
+# API parameters forbidden in Fable 5 (all return HTTP 400)
+thinking: {type: "disabled"}     ← thinking is always on
+temperature                       ← not supported
+top_p                             ← not supported
+top_k                             ← not supported
+assistant prefill                 ← not allowed
+
+# Response verification signals
+response.model                    →  which model actually ran
+content[].type == "fallback"      →  explicit fallback occurred
+response.usage.iterations         →  full attempt history (survives sticky routing)
+
+# Sticky routing
+After any fallback: system routes to Opus 4.8 for ~1 hour silently
+Only usage.iterations reveals this — no fallback block appears
 ```
 
 ```
