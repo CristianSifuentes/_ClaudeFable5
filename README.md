@@ -190,6 +190,31 @@ The Cyber Verification Program is the **only self-serve path into Glasswing toda
 
 For all other use cases, Fable 5 with correct fallback handling is the right path. Mythos 5 is not an upgrade you select for general productivity tasks — it is an access tier with a specific use-case rationale that Anthropic reviews before granting.
 
+**What Glasswing actually removes — and what it does not.** Mythos 5 is the same weights, same intelligence, same price; the only difference is the classifier layer. But Glasswing does **not** lift all of it:
+
+```
+Glasswing REMOVES:   the cybersecurity classifiers.
+                     If you measured an 8–9% refusal rate on a security
+                     workload, Glasswing takes that category to ZERO.
+
+Glasswing KEEPS:     the biology classifiers and the distillation classifier.
+                     These remain active even on Mythos 5.
+```
+
+**Who should apply:** teams with a *high and persistent* refusal rate in cybersecurity. For standard development, Fable 5 already works and Mythos adds no practical benefit.
+
+#### The "Invisible Steering" Episode — Separate Three Layers Precisely
+
+This is a governance story worth understanding because it shows how a silent safeguard becomes a visible, manageable one. Keep three layers strictly separate:
+
+| Layer | Content |
+|---|---|
+| **What Anthropic officially disclosed** | Certain safeguards *silently* limited the model's effectiveness — no notification in the response — affecting **~0.03% of traffic** on frontier-AI-infrastructure topics. Users got no signal at all. |
+| **What the community interpreted** | Readings ranged from "misaligned AI" to "market protection disguised as safety." These are **opinions, not additional facts.** |
+| **What actually changed** | On **June 11, 2026**, Anthropic acknowledged it had made the wrong tradeoff. The `frontier_llm` (distillation) category now surfaces as a **standard refusal** — detectable and handled with the same fallback routes you already use. The invisible became visible. |
+
+The practical lesson: a safeguard that produces *no signal* is the dangerous kind. Once `frontier_llm` became a normal `stop_reason: "refusal"`, it became something your instrumentation could catch. This is exactly why you instrument `stop_reason` on every path (see [Section 5 — Handling Refusals](#handling-refusals-and-false-positive-zones-in-production)).
+
 ### Agentic vs. Assistant: The Fundamental Distinction
 
 Every previous Claude model — including Opus 4.8 — was an **assistant model**: you ask a question, it answers; you give a task, it completes the next step; you need more, you ask again. The human is the loop.
@@ -845,6 +870,48 @@ except anthropic.BadRequestError as e:
     else:
         raise
 ```
+
+#### The 30-Day Policy in Full: What Your Legal Team Will Ask
+
+Thirty days is how long **every prompt and every response** sent to Fable 5 is stored on Anthropic's servers. **There is no opt-out** — not on the direct API, not on Bedrock, Vertex, or Foundry.
+
+```
+Why 30 days?  Security — detecting distributed attacks spread across many
+              requests over time (progressive jailbreaks, model-distillation
+              attempts). The data is NOT used to train new models.
+
+The asterisk: if retained content is flagged as a policy violation, it can be
+              kept for up to TWO YEARS. Anthropic's wording for auto-deletion
+              is "almost all cases" — which is not a guarantee of universal
+              deletion. Your legal team will underline this.
+```
+
+**Why ZDR specifically returns a 400:** Fable 5 and Mythos 5 are classified as **Covered Models**, and the 30-day policy **overrides any pre-existing ZDR agreement** for these specific models. It is a model-level restriction, not a bug.
+
+#### The Partial Workaround: Workspace-Level Retention
+
+If only *some* of your workloads can accept the 30 days, you can enable retention on an **individual workspace** inside Claude Console. The rest of your organization keeps ZDR, and the exposure stays contained to that one workspace.
+
+```
+Organization (ZDR enforced)
+├── Workspace A  → retention enabled  → Fable 5 works here
+├── Workspace B  → ZDR preserved      → Fable 5 returns 400 (use Opus 4.8)
+└── Workspace C  → ZDR preserved      → Fable 5 returns 400 (use Opus 4.8)
+```
+
+#### HIPAA / BAA: The Path Exists, But Features Are Blocked
+
+For teams under HIPAA with a Business Associate Agreement, Fable 5 is reachable — but several features are **blocked**:
+
+```
+Blocked under HIPAA + BAA:
+  ✗ Claude Code        ✗ Files API        ✗ Batch processing
+  ✗ Web fetch          ✗ Computer use
+```
+
+If you need **your cloud provider** to govern retention rather than Anthropic, use **Bedrock, Vertex, or Foundry** — there, AWS, Google, or Microsoft set the rules.
+
+> **The apartment-building analogy.** The landlord has a camera policy that records 30 days. You can move to a different building where your own manager controls the recordings (Bedrock/Vertex/Foundry). But you cannot live in *this* building and ask the cameras not to record you (no ZDR on first-party Fable 5).
 
 ### Token Pricing Model
 
@@ -2911,6 +2978,77 @@ Reliability
 
 **Segregate every quality and cost metric by serving model.** A dashboard that averages Fable 5 and fallback-Opus turns together is reporting a fiction. Tag each turn with its serving model (resolved from `usage.iterations`, not `response.model`) and split the four buckets above before you compute any average. With an 8–9% fallback rate on heavy tasks, an un-segregated "Fable 5 quality" number is really a blend you never agreed to measure.
 
+### Detecting Drift in Your Pipeline: The Canary Eval
+
+Classifiers and routing behavior change over time — the [invisible-steering episode](#the-invisible-steering-episode--separate-three-layers-precisely) proved that silently. The defense is a **canary eval**: a small set of fixed prompts you run on a schedule.
+
+```
+Canary eval design
+──────────────────────────────────────────────────────────────
+Mix:      sensitive-domain prompts  +  one neutral CONTROL prompt
+Frozen:   a rubric that NEVER changes between runs
+Track:    trends over time, not individual runs
+──────────────────────────────────────────────────────────────
+Control stable, domain prompts drop  →  change is localized to those domains
+Control ALSO drops                   →  something broad shifted (model/routing)
+```
+
+This is the same instrumentation discipline as the [reproducible comparison harness](#building-a-reproducible-model-comparison-harness) — a frozen rubric and a control anchor are what let you attribute a score change to *them*, not to your own setup.
+
+### The Fable 5 Adoption Decision Framework
+
+The capstone question is organizational, not technical: **is Fable 5 viable for your context, or do you need to argue for another route?** Evaluate four factors **in sequence.** If the first fails, you do not need to evaluate the rest.
+
+```
+┌─ 1. RETENTION ─ binary gate ────────────────────────────────────────┐
+│  Can your org accept 30-day retention?                               │
+│  Strict ZDR with no workspace-level exception                        │
+│    → Fable 5 is NOT available on the first-party API. STOP HERE.     │
+│  (Workspace-level retention or Bedrock/Vertex/Foundry may reopen it.)│
+└──────────────────────────────────────────────────────────────────────┘
+              │ pass
+              ▼
+┌─ 2. REFUSAL RATE for your domain ───────────────────────────────────┐
+│  Published average < 5%. Cyber & biology: 8–9%.                     │
+│  Your number depends on YOUR prompt mix — measure before sizing.    │
+└──────────────────────────────────────────────────────────────────────┘
+              │ acceptable
+              ▼
+┌─ 3. FALLBACK COVERAGE ──────────────────────────────────────────────┐
+│  Does every part of your pipeline have a recovery path configured?  │
+│  Requests without a fallback are the ones most likely to be         │
+│  refused with no recovery.                                          │
+└──────────────────────────────────────────────────────────────────────┘
+              │ covered
+              ▼
+┌─ 4. ADJUSTED COST PER COMPLETED TASK ───────────────────────────────┐
+│  Pre-output refusals are free. >95% of sessions involve no fallback.│
+│  But if your Fable success rate doesn't justify the premium over    │
+│  Opus → pin Opus directly.                                          │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+Ask yourself: **on which of these four factors is your organization most likely to fail?** That is where to concentrate your evaluation effort.
+
+#### Document It as an Architecture Decision Record
+
+When you present this to your team, write it up as an **ADR** — not a Slack message. Include:
+
+```
+INCLUDE                                   DO NOT INCLUDE
+──────────────────────────────────────────────────────────────────
+Context                                   Unverified user anecdotes
+Tested evidence (your canary evals)       Community speculation as fact
+Accepted tradeoffs                        Vendor marketing numbers
+Mitigations implemented
+Refusal-handling plan
+Drift-monitoring plan
+──────────────────────────────────────────────────────────────────
+Every claim dated and traceable to YOUR OWN canary evals.
+```
+
+The discipline is the same one that runs through this entire guide: **trust what your own instrumentation shows on your own traffic, dated — not the launch-day bar chart.**
+
 ---
 
 ## Quick Reference
@@ -3191,10 +3329,33 @@ Foundry fallback penalty  →  Context drops 1M → 200K on Opus 4.8 fallback
 ZDR org setting enabled   →  Fable 5 returns HTTP 400 silently
 Fix                       →  Use Opus 4.8, or disable ZDR for API traffic
 
+# 30-day retention — no opt-out (all platforms)
+Default 30 days; NOT used for training; rationale = distributed-attack detection
+Policy-violation flag → kept up to 2 YEARS ("almost all cases" auto-delete)
+Fable 5 / Mythos 5 = "Covered Models" → 30-day policy OVERRIDES any ZDR deal
+Workaround: enable retention on ONE workspace; rest of org keeps ZDR
+HIPAA+BAA blocks: Claude Code, Files API, Batch, Web fetch, Computer use
+Want cloud-provider-governed retention? → Bedrock / Vertex / Foundry
+
 # Fable 5 vs Mythos 5
 Fable 5    →  classifiers on, self-serve, all platforms
 Mythos 5   →  no classifiers, Project Glasswing only
 Glasswing self-serve path →  claude.com/form/cyber-use-case
+Glasswing REMOVES cyber classifiers (8–9% → 0); KEEPS biology + distillation
+frontier_llm (distillation): invisible until 2026-06-11, now a standard refusal
+
+# Adoption decision framework — evaluate IN ORDER, stop at first failure
+1. Retention: can you accept 30 days? (strict ZDR, no workspace path → STOP)
+2. Refusal rate for YOUR domain (avg <5%, cyber/bio 8–9% — measure first)
+3. Fallback coverage: every pipeline path has a recovery route?
+4. Adjusted cost/completed-task: if success rate doesn't beat the premium → pin Opus
+Document as an ADR: context, tested evidence, tradeoffs, mitigations,
+refusal plan, drift plan. NO unverified anecdotes — only dated canary-eval data.
+
+# Drift detection — canary eval
+Fixed prompts on a schedule: sensitive-domain + one neutral CONTROL.
+Frozen rubric, track trends not single runs.
+Control stable + domain drops → localized; control also drops → broad shift.
 ```
 
 ```bash
