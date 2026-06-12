@@ -245,11 +245,16 @@ For agentic work, the recommended starting point is **`max_tokens: 64000`** — 
 
 A single long-context agentic session has been documented consuming **78.2 million tokens and costing \$99.26** — nearly 90% of an entire day's spend in one loop. More context can produce *worse* output and a higher bill. Long context is a capability to deploy deliberately, not a default to max out.
 
-#### The New Tokenizer Inflates Your Existing Prompts
+#### The Tokenizer Caveat: Inflation Depends on Where You Migrate From
 
-Fable 5's tokenizer produces more tokens for the same text than previous models. Text that occupied **700,000 tokens** on an earlier model can rise to **~945,000 tokens** on Fable 5. A prompt you believed was safe at 800K can cross the 1M ceiling under the new tokenizer and start throwing errors.
+This is the most misunderstood point about Fable 5 token counts, so be precise about it:
 
-**Verification is mandatory.** Use the free `count_tokens` endpoint on your *real* prompts before assuming they fit:
+- **Coming from Opus 4.8 (or 4.7):** the tokenizer is **identical**. Fable 5 shares the tokenizer introduced with Opus 4.7. 1,000 tokens there is 1,000 tokens here — no inflation.
+- **Coming from pre-4.7 models** (Opus 4.6, older Sonnet, older Haiku): those used a *different* tokenizer that produced fewer tokens for the same text. Under Fable 5's tokenizer the same content can produce **up to ~35% more tokens**. Text that occupied **700,000 tokens** on one of those older models can rise toward **~945,000 tokens** on Fable 5 — and a prompt you believed was safe at 800K can cross the 1M ceiling and start throwing errors.
+
+(The cost implications of this delta are covered in [Section 4 — The Real Cost Multiplier](#the-real-cost-multiplier-tokenizer-delta).)
+
+**Verification is mandatory whenever your origin model predates Opus 4.7.** Use the free `count_tokens` endpoint on your *real* prompts before assuming they fit:
 
 ```python
 # Confirm the prompt actually fits BEFORE you send it
@@ -258,10 +263,10 @@ count = client.messages.count_tokens(
     messages=[{"role": "user", "content": your_real_prompt}]
 )
 print(f"Input tokens under Fable 5 tokenizer: {count.input_tokens}")
-# A prompt that fit at 800K on Opus 4.8 may report ~945K here.
+# Identical to an Opus 4.8 count; up to ~35% higher than a pre-4.7 count.
 ```
 
-Do not extrapolate from an older model's token count — measure under Fable 5's own tokenizer.
+Do not extrapolate from a *pre-4.7* model's token count — measure under Fable 5's own tokenizer.
 
 ### Constitutional AI & RLHF: The Safety Layer
 
@@ -857,6 +862,109 @@ task on Fable 5 run multiple times with retries.
 
 The token efficiency advantage (~50% fewer tokens for equivalent results) partially offsets this multiplier. But the net effect for most workloads is still a higher per-task cost compared to Opus 4.8. This means you need to be deliberate: **use Fable 5 for tasks that are large, bounded, and verifiable** — not for tasks where Sonnet 4.5 or Opus 4 would do.
 
+### The Real Cost Multiplier: Tokenizer Delta
+
+The price table says the move from Opus 4.8 to Fable 5 costs 2×: \$10/M input vs \$5, \$50/M output vs \$25. Clean and simple. But when you measure your *actual* end-of-month bill, the number often isn't 2×. It can be **2.56×, or even 2.7×.** That phantom difference appears on no price sheet, and understanding where it comes from is what separates a profitable migration from one that detonates your budget.
+
+#### Why the Real Bill Doesn't Match the List Price
+
+Correct the misconception up front: **the multiplier depends entirely on which model you are migrating *from*.**
+
+```
+Origin model            Tokenizer vs Fable 5        Real multiplier
+──────────────────────────────────────────────────────────────────────
+Opus 4.8 / Opus 4.7     IDENTICAL (shared since 4.7)  Pure 2× (price only)
+Opus 4.6 / old Sonnet   Different — produced FEWER     2.56× (≈28% more tokens)
+  / old Haiku           tokens for the same text      up to 2.7× (≈35% more)
+──────────────────────────────────────────────────────────────────────
+```
+
+If you come from Opus 4.8, 1,000 tokens there is 1,000 tokens on Fable 5 — the count does not change, only the price doubled. The 2.56×–2.7× only appears when your starting point is **pre-4.7**, because those older tokenizers produced fewer tokens for identical content. Fable 5's tokenizer can generate up to **35% more tokens** on the same text.
+
+**The taxi analogy:**
+
+```
+The new taxi charges 2× per kilometer.                    → base 2×
+Your GPS now measures the same route as 28% longer.       → 2.56×
+If the GPS stretches the measurement to 35% longer.       → 2.7×
+```
+
+Your real number depends on the origin model *and* the specific content of your prompts.
+
+#### Measure Your Real Delta — Don't Guess
+
+Do not apply a generic multiplier. The `count_tokens` endpoint is **free**, has rate limits separate from message creation, and returns the exact count without generating a response. Call it twice with the same payload — once with your current model, once with `claude-fable-5` — and divide new by old. That quotient is your **tokenizer ratio** for that prompt.
+
+```python
+def tokenizer_ratio(payload: dict, old_model: str) -> float:
+    old = client.messages.count_tokens(model=old_model, **payload)
+    new = client.messages.count_tokens(model="claude-fable-5", **payload)
+    return new.input_tokens / old.input_tokens   # 1.00 if from Opus 4.8
+
+# Run over a REPRESENTATIVE sample of real traffic — never one example.
+ratios = [tokenizer_ratio(p, "claude-opus-4-6") for p in representative_payloads]
+avg = sum(ratios) / len(ratios)
+print(f"avg={avg:.3f}  min={min(ratios):.3f}  max={max(ratios):.3f}")
+```
+
+Two rules make this estimate trustworthy:
+
+1. **Use a representative set of real traffic**, and include in each sample your *system prompt*, the *tools* you pass (if you use tool use), and realistic messages. Measuring one lightbulb while you also run a washing machine tells you nothing about real consumption.
+2. **Look at the dispersion, not just the average.** Some prompts may come in at 1.05 and others at 1.35. The spread tells you which workloads are most affected and where to concentrate optimization.
+
+### Refusals: Paying for Responses You Never See
+
+This is the cost that bleeds silently. A refusal arrives as **HTTP 200**, so your error monitoring never sees it. The only signal is `stop_reason == "refusal"` — and there are two types, with very different billing consequences.
+
+| Refusal type | What happens | Billing |
+|---|---|---|
+| **Pre-output refusal** | Model declines *before* generating anything; `content` is empty | **Zero cost.** Doesn't even count against rate limits |
+| **Mid-stream refusal** | Model starts generating, produces tokens, then stops | Input tokens **and** the already-generated output tokens are billed at normal rate |
+| **Mid-stream + fallback (non-streaming)** | Partial output is *stripped* from your response body but remains billed in `usage.iterations` | **Phantom tokens** — you pay for output that appears nowhere in the response |
+
+The third scenario is the most dangerous, because the gap is only visible by reading `usage.iterations`. If your monitoring stops at the response body, those phantom costs accumulate with no alert.
+
+```python
+# Catch refusals AND phantom-billed tokens that never reach the body
+if response.stop_reason == "refusal":
+    log.warning("Refusal — HTTP 200, no error raised")
+
+billed_output = response.usage.output_tokens
+visible_output = sum(len(b.text) for b in response.content if b.type == "text")
+# If iterations exist, sum what each attempt actually billed:
+if hasattr(response.usage, "iterations"):
+    iter_billed = sum(it.output_tokens for it in response.usage.iterations)
+    if iter_billed > billed_output:
+        log.warning("Phantom tokens: %d billed in iterations vs %d in body",
+                    iter_billed, billed_output)
+```
+
+**If a specific route shows many refusals,** compare the fallback setup against pointing that route *directly* at the more permissive model from the start. You avoid the extra round trip and the phantom tokens of the declined attempt entirely.
+
+### Deciding When to Pay the Fable 5 Premium
+
+Do not compare list prices. The correct metric is **cost per completed task** — cost per attempt divided by success rate. It is the only number that reflects what it actually costs to *solve* a problem, not what it costs to *attempt* one.
+
+```
+cost_per_completed_task = cost_per_attempt / success_rate
+```
+
+Worked example:
+
+```
+Fable 5:        $4.50 / attempt  ×  80% success  →  $5.63 per completed task
+Cheaper model:  $1.00 / attempt  ×  54% success  →  $1.85 per completed task
+```
+
+The cheaper model *sounds* like the winner — but if each of its failures requires human supervision, that invisible cost changes the equation.
+
+```
+Short tasks, equal success rate     →  Opus wins (same token count, half the price)
+Long agentic tasks where solving
+  in a single pass matters          →  Fable 5 justifies the premium IF its
+                                       success rate is materially higher
+```
+
 ### API Parameters That Produce 400 Errors in Fable 5
 
 This is the highest-frequency breaking change when migrating from Opus 4.8 or earlier models. The minimum valid payload for Fable 5 has three required fields and three forbidden ones.
@@ -995,16 +1103,15 @@ max      → $0.72
 
 Because thinking tokens are billed **regardless of `display` mode**, `effort` is the lever — not visibility settings.
 
-**Why Fable 5 costs even more than the per-token price suggests:**
+**The real cost multiplier depends on what you migrate *from*** (see [The Real Cost Multiplier](#the-real-cost-multiplier-tokenizer-delta) below for the full breakdown):
 
 ```
-Fable 5's tokenizer produces  ~30% more tokens  than Opus 4.8 for the same content
-Fable 5's per-token price is  2×                Opus 4.8's price
-                              ─────────────────────────────────────
-Compound multiplier:          ~2.5×             before `effort` is even considered
+Migrating from Opus 4.8 →  pure 2× — SAME tokenizer, only price doubled
+Migrating from pre-4.7  →  2.56×–2.7× — different (smaller-output) tokenizer
+                           inflates token counts by up to 35% on top of the 2×
 ```
 
-Stack the ~2.5x tokenizer/pricing multiplier with the ~7x spread between effort levels, and `effort` stops being a minor tuning knob — it becomes your primary budget control.
+Stack that origin-dependent multiplier with the ~7x spread between effort levels, and `effort` stops being a minor tuning knob — it becomes your primary budget control.
 
 **Choosing `effort` per step in a workflow:**
 
@@ -2562,7 +2669,8 @@ print(response.model)                # May differ from requested model
 print(response.usage.input_tokens)   # Cost visibility: input
 print(response.usage.output_tokens)  # Cost visibility: output
 
-# Verify a prompt FITS before sending (tokenizer inflates ~700K → ~945K)
+# Verify a prompt FITS before sending (only matters from PRE-4.7 origins:
+# tokenizer can inflate ~700K → ~945K; identical to an Opus 4.8 count)
 count = client.messages.count_tokens(model="claude-fable-5", messages=msgs)
 print(count.input_tokens)            # free endpoint — measure, don't assume
 ```
@@ -2603,7 +2711,9 @@ max      → unrestricted reasoning — latency doesn't matter
 
 # Cost reality
 ~7x spread between low and max on the same task
-~2.5x compound multiplier vs Opus 4.8 (1.3x tokenizer × 2x price)
+Real migration multiplier depends on ORIGIN model:
+  from Opus 4.8/4.7 → pure 2x (SAME tokenizer, price only)
+  from pre-4.7       → 2.56x–2.7x (tokenizer adds up to +35% tokens)
 Thinking tokens billed regardless of `display` mode
 
 # Effort resolution priority in Claude Code (highest wins)
@@ -2714,6 +2824,29 @@ Add a control prompt that should never be refused:
 
 # Cost-per-completed-task is THE metric
 cost_per_completed_task = cost_per_attempt / success_rate
+```
+
+```
+# Measure your REAL tokenizer ratio (don't assume 2x)
+ratio = count_tokens(fable-5) / count_tokens(your_current_model)
+  from Opus 4.8 → ratio = 1.00 (identical tokenizer)
+  from pre-4.7  → ratio up to 1.35
+Run over a REPRESENTATIVE traffic set; include system prompt + tools.
+Watch dispersion (1.05 vs 1.35), not just the average.
+
+# Refusals arrive as HTTP 200 — only stop_reason == "refusal" reveals them
+Pre-output refusal             → empty content, ZERO cost, no rate-limit hit
+Mid-stream refusal             → input + already-generated output BILLED
+Mid-stream + fallback (non-stream) → partial output stripped from body
+                                 but still billed in usage.iterations (PHANTOM)
+Many refusals on a route? Point it directly at the permissive model —
+skip the round trip and the phantom tokens of the declined attempt.
+
+# When to pay the Fable 5 premium
+Short task, equal success rate     → Opus wins (same tokens, half price)
+Long agentic, higher success rate  → Fable 5 justifies the premium
+Example: $4.50 @ 80% = $5.63/task   vs   $1.00 @ 54% = $1.85/task
+         (but cheap-model failures may need human supervision)
 ```
 
 ```
