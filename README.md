@@ -1192,13 +1192,139 @@ print(f"Actual:    {response.model}")
 print(f"Tokens:    in={response.usage.input_tokens} out={response.usage.output_tokens}")
 ```
 
+### Prompt Caching: The 0.1× Read and the 512-Token Minimum
+
+The single \$99.26 / 78.2M-token session is what happens when a loop runs without brakes. There are three concrete locks that prevent it, and all live in the API: **prompt caching, spend caps, and Message Batches.** Each one lowers your cost *per completed task* on Fable 5.
+
+Prompt caching stores a prefix of your prompt and, on subsequent requests, charges only **0.1×** to read it instead of **1×** to process it from scratch. It is the direct answer to "the same prefix repeats on every call — how do I stop paying for it each time?"
+
+#### The Minimum That Fails Silently
+
+The cache entry only gets created if the prefix meets a minimum token count. In Fable 5 that minimum **dropped to 512 tokens** on the direct API, Vertex AI, Claude Platform on AWS, and Microsoft Foundry. **Amazon Bedrock stays at 1,024.** (See [Section 5 — Prompt Caching: Platform Differences](#prompt-caching-platform-differences) for the per-platform matrix.)
+
+```
+Prefix ≥ minimum   →  cache entry created, cache_creation_input_tokens > 0
+Prefix < minimum   →  NO error. cache_creation_input_tokens returns 0,
+                      and you pay full price without knowing it.
+```
+
+There is no error when you fall short — the only signal is `cache_creation_input_tokens == 0`.
+
+#### When the Cache Pays for Itself
+
+Faster than you'd expect. With the **5-minute TTL**, a cache write costs **1.25×** and a read costs **0.1×**:
+
+```
+5-minute TTL
+  Request 1 (write):  1.25×
+  Request 2 (read):   0.10×
+  ───────────────────────────
+  Total:              1.35×   vs  2.00× uncached   →  ahead from request 2
+
+1-hour TTL
+  Write costs 2× → you need THREE requests to break even.
+```
+
+Two uncomfortable caveats:
+
+- A **cache miss on Fable 5 costs double in absolute dollars** what it costs on Opus 4.8 (the 2× price applies to the write too).
+- **Any single-byte change before your breakpoint invalidates the entire cache** and turns reads back into writes. After every deploy that touches the prompt, check `cache_read_input_tokens` to confirm the cache is still warm.
+
+#### Structuring the Prompt for Maximum Hits
+
+Cache matching is a **strict prefix match**: everything before your breakpoint must be byte-for-byte identical between requests. The optimal structure has two clear layers:
+
+```
+┌─ STABLE (cache this) ─ marked with cache_control: {"type": "ephemeral"} ─┐
+│  System prompt  ·  business rules  ·  tool definitions + JSON schemas    │
+├─ VARIABLE (outside the cached prefix) ──────────────────────────────────┤
+│  User message  ·  session data  ·  anything that changes per request    │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+```python
+response = client.messages.create(
+    model="claude-fable-5",
+    max_tokens=64000,
+    system=[
+        {
+            "type": "text",
+            "text": stable_system_prompt_and_business_rules,
+            "cache_control": {"type": "ephemeral"},   # breakpoint here
+        }
+    ],
+    tools=stable_tool_definitions,                     # schemas: identical every call
+    messages=[{"role": "user", "content": per_request_user_message}],
+)
+print("cache write:", response.usage.cache_creation_input_tokens)
+print("cache read: ", response.usage.cache_read_input_tokens)
+```
+
+**Tool definitions are ideal cache candidates** — a `get_expenses` schema looks identical in request 1 and request 50. A documented benchmark with **75 tools** showed caching cut billed input tokens by **38% with no change in accuracy.**
+
+**What breaks the cache with no warning:** reordering tools, adding a new tool *before* the existing ones, or flipping a flag in the system prompt. Any of these invalidates everything after it.
+
+### Spend Caps: Four Layers for an Agent With No Ceiling
+
+When an agent iterates freely, caching alone is not enough. You need four layers that work like a building's safety systems — independent, defense-in-depth.
+
+| Layer | Hard or soft? | Does the model see it? | Notes |
+|---|---|---|---|
+| `max_tokens` | Hard cap **per request** | **No** | Output truncates if hit. Agentic starting point: **64,000** |
+| `task_budget` (in `output_config`) | Soft cap **per session** | **Yes** — acts as a countdown | Minimum **20,000**. Requires beta header `task-budgets-2026-03-13` |
+| `effort` per route | Cost lever | n/a | `low` for high-volume subagents, `high` default, `xhigh` for critical implementation. Spread: **\$0.10 → \$0.72** on the same task |
+| Your own session tracking | External guardrail | n/a | Sum `thinking_tokens` per session, alert on overage |
+
+```python
+response = client.messages.create(
+    model="claude-fable-5",
+    max_tokens=64000,                          # hard per-request cap (model can't see it)
+    extra_headers={"anthropic-beta": "task-budgets-2026-03-13"},
+    output_config={
+        "effort": "high",
+        "task_budget": 200000,                 # session countdown the model CAN see (min 20k)
+    },
+    messages=messages,
+)
+```
+
+The distinction that matters: `max_tokens` is a **hard per-request ceiling the model cannot see** (it just gets truncated). `task_budget` is a **session-wide countdown the model *can* see** — a total budget for the whole project rather than a per-invoice limit, so it can pace itself.
+
+**No built-in mechanism warns you that a session is getting expensive.** Your own session tracking — code summing `thinking_tokens` across the session with alerts when the budget is exceeded — is the only thing that would have flagged the \$99 session *before* it finished.
+
+### Message Batches: Pay Half for Latency-Tolerant Work
+
+The Message Batches API **cuts Fable 5's price in half**: \$5/M input, \$25/M output. It **stacks with caching**, so the savings compound.
+
+The tradeoff is latency — results do not arrive instantly.
+
+```
+GOOD fit for Batches            BAD fit for Batches
+──────────────────────────────────────────────────────────────
+Classify thousands of           Real-time chat
+  tickets overnight             Any flow where step 2 depends
+Off-hours evaluation runs         on step 1's output
+Agentic search where many       Anything a user is waiting on
+  items share context             synchronously
+──────────────────────────────────────────────────────────────
+```
+
+#### Tying It Together: Cost Per Completed Task
+
+The metric that unifies all three locks is **cost per completed task** — cost per attempt ÷ success rate — not price per token (covered in full at [The Real Cost Multiplier](#deciding-when-to-pay-the-fable-5-premium)). Measure it on **your own traffic in a canary**, not on generic benchmarks. And if a route has a high refusal rate, pinning Opus directly can be cheaper than paying for the declined attempt's round trip plus the fallback.
+
 ### Cost Optimization Checklist
 
 - [ ] Route classification/extraction tasks to Haiku 3.5
-- [ ] Use prompt caching for system prompts > 1024 tokens (API feature)
-- [ ] Set `max_tokens` explicitly — never leave it at the maximum
+- [ ] Use prompt caching for stable prefixes ≥ 512 tokens (≥ 1024 on Bedrock)
+- [ ] Mark stable content (system prompt, rules, tool schemas) with `cache_control: ephemeral`; keep variable content outside the prefix
+- [ ] After every prompt-touching deploy, verify `cache_read_input_tokens > 0` (cache still warm)
+- [ ] Set `max_tokens` explicitly (hard per-request cap; agentic start: 64,000)
+- [ ] Set `task_budget` ≥ 20,000 in `output_config` for agentic sessions (beta header `task-budgets-2026-03-13`)
+- [ ] Pin `effort` per route (low for subagents, xhigh only for critical implementation)
+- [ ] Run your own session tracking with alerts — nothing built-in warns you a session is getting expensive
 - [ ] Compress context aggressively before injection (summaries, not raw text)
-- [ ] Batch non-time-sensitive requests using the Batch API (50% cost reduction)
+- [ ] Batch latency-tolerant requests via Message Batches (50% off, stacks with caching)
 - [ ] Monitor spend per feature, not per user
 
 ---
@@ -2847,6 +2973,29 @@ Short task, equal success rate     → Opus wins (same tokens, half price)
 Long agentic, higher success rate  → Fable 5 justifies the premium
 Example: $4.50 @ 80% = $5.63/task   vs   $1.00 @ 54% = $1.85/task
          (but cheap-model failures may need human supervision)
+```
+
+```
+# Three cost locks (all in the API)
+1. Prompt caching — read at 0.1x instead of 1x
+   Min prefix: 512 tok (API/Vertex/AWS/Foundry) · 1024 (Bedrock)
+   Below min → cache_creation_input_tokens = 0, full price, NO error
+   5-min TTL: write 1.25x + read 0.1x = 1.35x → ahead from request 2
+   1-hour TTL: write 2x → break even at request 3
+   Strict prefix match: 1 byte change before breakpoint = full re-write
+   Stable (system/rules/tool schemas) cached; variable (user msg) outside
+   Verify after deploy: cache_read_input_tokens > 0
+
+2. Spend caps — four layers
+   max_tokens   = hard per-request cap, model can't see it (start 64,000)
+   task_budget  = session countdown the model CAN see (min 20,000;
+                  beta header task-budgets-2026-03-13)
+   effort       = per-route lever ($0.10 low → $0.72 max, same task)
+   session tracking = YOUR code; nothing built-in alerts on cost
+
+3. Message Batches — half price ($5/M in, $25/M out), stacks w/ caching
+   GOOD: overnight ticket classification, off-hours evals, shared-context search
+   BAD:  real-time chat, step-2-depends-on-step-1 flows
 ```
 
 ```
