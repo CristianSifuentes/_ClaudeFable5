@@ -2163,6 +2163,135 @@ User query: "What is the competitive landscape for X?"
 
 The key architectural insight: **use Fable 5 for synthesis and orchestration; use cheaper models for data gathering and extraction.** This cuts costs by 60–80% compared to running everything through the flagship model.
 
+### Building a Reproducible Model Comparison Harness
+
+Launch-day charts tell you nothing about *your* workload. A model can dominate SWE-bench and still cost 3× more per completed task in your specific pipeline. The only way to know which model wins for you is to run the comparison yourself, with your own prompts — and the only way that comparison is trustworthy is if you eliminate every variable except the model.
+
+This section turns the [critical-benchmark framework from Section 6](#reading-benchmarks-critically-the-asterisk-behind-every-number) into something executable.
+
+#### Rule Zero: The Model Is the Only Variable
+
+If any condition changes between runs, the numbers are garbage. Pin everything else.
+
+```
+Held identical between runs        Why it matters
+──────────────────────────────────────────────────────────────────
+Prompt — bit-for-bit identical     A one-word change can trip the safety
+                                   classifier and trigger a silent fallback,
+                                   contaminating the sample.
+max_tokens                         Same ceiling on both models.
+effort level                       Pinned to the same value.
+thinking configuration             ← THE trap that bites everyone (below)
+──────────────────────────────────────────────────────────────────
+```
+
+**The thinking trap.** Fable 5 runs adaptive thinking *always on* by default. Opus 4.8 does **not** think unless you explicitly pass `type: "adaptive"`. If you leave both on their defaults, you are not comparing models — you are comparing two different configurations.
+
+```python
+# WRONG — comparing configurations, not models
+fable = client.messages.create(model="claude-fable-5", max_tokens=2048, ...)
+opus  = client.messages.create(model="claude-opus-4-8", max_tokens=2048, ...)
+#       Fable thinks (default), Opus does not (default) → invalid comparison
+
+# RIGHT — thinking made equivalent on both
+common = {
+    "max_tokens": 2048,
+    "thinking": {"type": "adaptive"},   # Opus 4.8 now thinks too
+    "output_config": {"effort": "high"},
+    "messages": messages,               # bit-for-bit identical
+}
+fable = client.messages.create(model="claude-fable-5", **common)
+opus  = client.messages.create(model="claude-opus-4-8", **common)
+```
+
+#### Separate Sensitive Domains Into Their Own Bucket
+
+Cybersecurity and biology tasks belong in a **separate eval bucket** because Fable 5 routes them to Opus 4.8 regardless. Comparing the two models there measures nothing about Fable 5 itself — you would be averaging apples with pears. Keep these domains out of your headline comparison.
+
+#### The Three Metrics — and Each One's Trap
+
+```
+Metric              The trap                          The fix
+────────────────────────────────────────────────────────────────────────
+Tokens consumed     Reading only the text you get     Read output_tokens
+                    underestimates real spend.        AND thinking_tokens.
+
+Response latency    Mixing network latency with       Measure model time;
+                    model latency; fallback attempts  flag fallback turns
+                    inflate time-to-first-byte.       separately.
+
+Quality / cost      "Cost per request" is the wrong   cost_per_completed_task
+  per task          number.                           = cost_per_attempt
+                                                        / success_rate
+────────────────────────────────────────────────────────────────────────
+```
+
+**Tokens — the invisible reasoning you still pay for:**
+
+```python
+u = response.usage
+thinking = u.output_tokens_details.thinking_tokens   # e.g. 312
+text     = u.output_tokens - thinking                # e.g.  36
+# You are billed for 348 output tokens, but only 36 are useful text.
+# Reading the text alone underestimates spend by ~9×.
+```
+
+**Latency — fallbacks look slow without anything being broken:** when the primary model declines and the system attempts a fallback, your time-to-first-byte includes the *declined attempt* plus the fallback model's startup. Tag these turns; don't let them poison your p50/p95.
+
+**Quality — verdicts, not vibes:** for tasks with a correct answer, use binary verdicts with multiple grading passes. For open-ended tasks, use pairwise comparison. Then divide by success rate: an expensive model that nails it on the first try can be cheaper than a cheap model that needs three retries.
+
+#### Segregate Every Turn by Which Model Actually Served It
+
+`response.model` alone does not cover sticky routing — after a fallback, subsequent turns can be served by the fallback model for ~1 hour with **no visible fallback block**. It looks like Fable 5. It's Opus.
+
+`usage.iterations` is the reliable signal. Think of it as a referee who records which player took every penalty, even when the crowd missed the substitution. Each entry is one attempt:
+
+```
+type: "message", output_tokens = 0   →  requested model DECLINED
+type: "fallback_message"             →  tells you who actually served
+stop_reason: "refusal"               →  every model in the chain declined
+```
+
+With those signals, sort every turn into **four buckets** and never collapse them:
+
+```
+1. Served by the REQUESTED model     →  clean data
+2. Requested model DECLINED          →  invisible refusals (error monitoring misses these)
+3. Served by the FALLBACK model      →  count under the fallback model, NEVER the requested one
+4. Even the fallback FAILED          →  full-chain refusal
+```
+
+Artificial Analysis measured an **8–9% fallback rate on heavy tasks**. Without segregation, your averages are a silent blend of two different models — and you won't know it.
+
+#### Automating the Harness in CI
+
+Send the same fixed prompts on a schedule, score against a frozen rubric, and store the traces. If the score changes, the *model* changed — not your setup.
+
+```python
+# Pseudocode: scheduled comparison job
+for prompt in FROZEN_EVAL_SET:               # bit-for-bit, version-controlled
+    for model in ("claude-fable-5", "claude-opus-4-8"):
+        r = client.messages.create(model=model, **PINNED_CONFIG, messages=prompt)
+        served_by = resolve_serving_model(r)  # reads usage.iterations
+        bucket    = classify_turn(r)          # one of the four buckets
+        record(prompt.id, model, served_by, bucket,
+               tokens=r.usage.output_tokens,
+               thinking=r.usage.output_tokens_details.thinking_tokens,
+               latency=measured_latency,
+               verdict=grade(r, FROZEN_RUBRIC))
+
+assert control_prompt_verdict == "pass"      # see control-prompt note below
+```
+
+**Include a control prompt that should never be refused.** It is your anchor:
+
+```
+Control prompt comes back changed         →  the whole model changed
+Only domain prompts come back changed     →  the change is localized to those domains
+```
+
+Ask yourself right now: what is your most frequent production route — and are you segregating results by the model that *served* each turn, or silently averaging a blend that includes fallbacks?
+
 ### Monitoring Dashboard Metrics
 
 Track these metrics in production. All of them:
@@ -2188,6 +2317,8 @@ Reliability
 ├── Retry rate
 ├── Circuit breaker trip rate
 ```
+
+**Segregate every quality and cost metric by serving model.** A dashboard that averages Fable 5 and fallback-Opus turns together is reporting a fiction. Tag each turn with its serving model (resolved from `usage.iterations`, not `response.model`) and split the four buckets above before you compute any average. With an 8–9% fallback rate on heavy tasks, an un-segregated "Fable 5 quality" number is really a blend you never agreed to measure.
 
 ---
 
@@ -2306,6 +2437,33 @@ Production requests hit FABLE 5 (classifier layer intercepts/redirects).
 4. How many attempts were averaged? (best-of-N hides reliability)
 5. Where did competitors' numbers come from?
 Any answer missing → it's marketing, not evidence.
+```
+
+```
+# Reproducible model-comparison harness — Rule Zero
+The model is the ONLY variable. Pin everything else:
+  - prompt: bit-for-bit identical (one word can trigger a fallback)
+  - max_tokens: same on both
+  - effort: same on both
+  - thinking: {"type":"adaptive"} on Opus 4.8 too
+    (else Fable thinks by default, Opus doesn't → invalid)
+Separate cybersecurity/biology into their own bucket (Fable reroutes them).
+
+# Segregate every turn into four buckets (by usage.iterations)
+1. Served by requested model        → clean data
+2. Requested model declined         → invisible refusal (output_tokens=0)
+3. Served by fallback model         → count under fallback, never requested
+4. Even the fallback failed         → stop_reason: refusal
+Heavy-task fallback rate ≈ 8–9% (Artificial Analysis). Don't blend.
+
+# CI harness
+Fixed prompts + frozen rubric + stored traces, on a schedule.
+Add a control prompt that should never be refused:
+  control changes      → whole model changed
+  only domain changes  → localized change
+
+# Cost-per-completed-task is THE metric
+cost_per_completed_task = cost_per_attempt / success_rate
 ```
 
 ```
