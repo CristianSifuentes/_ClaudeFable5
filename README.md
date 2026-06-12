@@ -149,6 +149,32 @@ Claude Mythos 5
 
 Both models share the same pricing tier: `$10/M input tokens · $50/M output tokens`.
 
+**Be precise about how identical these two are.** The list of what they *share* is everything that matters technically:
+
+```
+Same weights        Same 1M-token window     Same price
+Same tokenizer      Same adaptive thinking
+──────────────────────────────────────────────────────────
+The difference is EXACTLY one thing:
+  Fable 5  → safety classifiers ACTIVE
+  Mythos 5 → safety classifiers ABSENT
+```
+
+This is what produces the asterisk on the benchmarks (see [Section 6 — The Asterisk](#the-asterisk-mythos-5-is-not-fable-5)). ExploitBench, BioMysteryBench, and ProgramBench were all run on **Mythos 5**, without the classifier layer. The base model is identical; the *production experience* is radically different. Mythos 5 is available only under Project Glasswing.
+
+#### What the Classifiers Actually Watch
+
+The safety classifiers are **not regex or banned-word lists**. They are **separate AI models** that run on top of every request, inspect the input and full context, and decide whether generation proceeds. They watch four concrete areas:
+
+| Classifier domain | Triggers on |
+|---|---|
+| **Cybersecurity** | Exploits, malware, lateral movement, reconnaissance |
+| **Dual-use biology & chemistry** | Bio/chem content with potential for harm |
+| **Distillation** (`frontier_llm`) | Attempts to extract capabilities to train competing models |
+| **`reasoning_extraction`** | Asking the model to reveal its internal reasoning |
+
+The documented average trigger rate is **under 5% of sessions** — but it concentrates heavily in specific domains (see [Section 5 — Refusals and False-Positive Zones](#handling-refusals-and-false-positive-zones-in-production)).
+
 ### Project Glasswing: Access to Mythos 5
 
 Glasswing is the Anthropic program that grants access to Mythos 5 — the classifier-free variant. There are four access paths:
@@ -1808,6 +1834,118 @@ Turn 10: [still within the hour window]
 
 Answer all three before starting any agentic task. Intensive workflows can exhaust subscription allocations in minutes.
 
+### Handling Refusals and False-Positive Zones in Production
+
+Your server returns HTTP 200. Your error dashboard is clean. Your pipeline keeps processing. But the model answered nothing — `content` came back empty and no one noticed. That is what a refusal looks like in Fable 5, and handling it is non-optional production code.
+
+#### The Anatomy of a Refusal
+
+When the model decides not to answer, you do **not** get a 403 or a 500. You get a clean **200**:
+
+```
+HTTP 200 OK
+  stop_reason:  "refusal"          ← the ONLY reliable signal
+  content:      []                 (empty array)
+  usage:        input_tokens > 0, output_tokens = 0
+```
+
+Code that checks status codes sees success. Logic that branches on "empty content" for other reasons sails right past. And **Message Batches double the trap**: a refused item arrives as `result.type: "succeeded"` with `stop_reason: "refusal"` inside.
+
+**The detection rule — no shortcuts:**
+
+```python
+if response.stop_reason == "refusal":
+    handle_refusal(response)     # fallback, log, or re-route
+else:
+    use(response.content)        # only safe to read content here
+```
+
+**Never branch on `stop_details`.** It can have `category: null`, `explanation: null`, or **both null at once** — that is normal behavior, not a bug. `stop_reason` is the signal; `stop_details` is not.
+
+#### Billing Depends on *When* the Classifier Fires
+
+```
+Fires BEFORE output      →  content empty, NO charge, does NOT count against rate limits
+Fires MID-generation     →  tokens already produced are billed at normal rate;
+                            discard the partial output
+```
+
+(This is the same pre-output vs mid-stream split detailed in [Section 4 — Refusals: Paying for Responses You Never See](#refusals-paying-for-responses-you-never-see).) Average documented rate: **under 5% of sessions.**
+
+#### Why Classifiers Produce False Positives
+
+The classifiers are **pattern matchers, not judges of intent.** They do not understand your purpose — they see vocabulary.
+
+> Picture a guard dog that cannot tell the mail carrier from the burglar, because both are approaching the door.
+
+The most documented false-positive zone is **defensive cybersecurity**:
+
+| Legitimate work | Why it trips the classifier |
+|---|---|
+| Pen-test pipeline that greps over exploit-db output | Looks identical to exploit *development* |
+| **Security code review** | Explicitly listed as a known false-positive example |
+| Decompilation / reverse engineering | Shares vocabulary with malware |
+| Medical physics (fluid-dynamics questions) | Reported triggering refusals |
+
+**The aggravating factor:** the classifier sees your **entire workspace** — your `CLAUDE.md`, repo context, directory names, and `git status`. A repository named `security-scanner` can raise a flag before you ask anything. (This is the "envelope, not the letter" problem from [Why Your First Request Can Trigger a Fallback](#why-your-first-request-can-trigger-a-fallback-without-sensitive-content).)
+
+**Reducing false positives:**
+
+```
+1. Start a fresh session (clear poisoned context)
+2. Be explicit about defensive purpose in the prompt
+3. Route sensitive workloads directly to Opus 4.8 (skip the round trip)
+4. Apply to the Cyber Verification Program if you do pentesting / red-teaming
+```
+
+Independent analyses measured **8–9% refusal rates** on science and security workloads — far above the general average.
+
+#### Three Fallback Routes, Ordered by Preference
+
+Your Fable 5 code needs to handle refusals. There are three routes:
+
+**1. Server-side fallbacks (preferred).** Add a `fallbacks` parameter with up to three models. If Fable 5 refuses, the server tries the next automatically — one request, one response. Requires beta header `server-side-fallback-2026-06-01`; available on Claude API and Claude Platform on AWS.
+
+```python
+response = client.messages.create(
+    model="claude-fable-5",
+    max_tokens=64000,
+    extra_headers={"anthropic-beta": "server-side-fallback-2026-06-01"},
+    fallbacks=["claude-opus-4-8"],   # up to 3; server retries on refusal
+    messages=messages,
+)
+```
+
+**2. SDK middleware.** Register it when you build the client. It intercepts every response, checks `stop_reason`, and retries with your fallback model on refusal. In streaming, it splices the fallback's events onto the open stream. Available in TypeScript, Python, Go, Java, and C#.
+
+**3. Manual refusal-ladder (Ruby, PHP, raw HTTP).** Use a **fallback credit token** so the retry does not re-bill your cache prefix as a cold write.
+
+**The streaming gotcha:** `stop_reason` is `null` in `message_start`. It arrives in `message_delta`. A listener that only reads `message_start` will **never** detect the refusal.
+
+```python
+with client.messages.stream(...) as stream:
+    for event in stream:
+        if event.type == "message_delta" and event.delta.stop_reason == "refusal":
+            switch_to_fallback()    # message_start is too early — stop_reason is null there
+```
+
+#### Three Fallback Edge Cases to Handle
+
+```
+Sticky routing            After a fallback, subsequent turns in the same
+                          conversation go straight to the fallback for ~1 hour,
+                          with NO fallback content block. Only response.model
+                          reveals it. (See Verifying You Are Running Fable 5.)
+
+Mid-stream decline        The content block closes, a fallback block appears,
+                          and the second model continues from where the first
+                          stopped — no reconnection.
+
+Echo block-by-block       When continuing a multi-model conversation, strip
+                          thinking blocks and tool_use blocks WITHOUT a result
+                          that precede the last fallback block — or you get a 400.
+```
+
 ### CLAUDE.md: Your Project's AI Constitution
 
 Every repository that uses Claude Code should have a `CLAUDE.md` file at the root. This file is **automatically injected** into every Claude Code session as context.
@@ -2906,6 +3044,39 @@ response.usage.iterations         →  full attempt history (survives sticky rou
 # Sticky routing
 After any fallback: system routes to Opus 4.8 for ~1 hour silently
 Only usage.iterations reveals this — no fallback block appears
+```
+
+```
+# Refusal anatomy — looks like success, isn't
+HTTP 200 · stop_reason == "refusal" · content == [] · output_tokens == 0
+Batches trap: result.type "succeeded" + stop_reason "refusal"
+Detection rule: read stop_reason FIRST; only read content if it's not "refusal"
+NEVER branch on stop_details (category/explanation can both be null — normal)
+Streaming: stop_reason is null in message_start, arrives in message_delta
+
+# The four safety classifiers (separate AI models, not word lists)
+cybersecurity · dual-use bio/chem · distillation (frontier_llm) · reasoning_extraction
+Avg trigger < 5% sessions; science/security workloads 8–9%
+
+# False-positive zones (pattern matchers, not intent judges)
+defensive pentest · SECURITY CODE REVIEW (listed) · decompilation/RE · med-physics
+Aggravator: classifier sees CLAUDE.md, repo name, dir names, git status
+Reduce: fresh session · state defensive purpose · route sensitive→Opus 4.8 ·
+        apply to Cyber Verification Program
+
+# Three fallback routes (preferred → manual)
+1. Server-side fallbacks: fallbacks=[...up to 3], beta header
+   server-side-fallback-2026-06-01 (Claude API + AWS). One request, one response.
+2. SDK middleware: intercepts stop_reason, retries, splices stream
+   (TS/Python/Go/Java/C#)
+3. Manual refusal-ladder (Ruby/PHP/raw HTTP): use a fallback credit token
+   so the retry doesn't re-bill cache prefix as a cold write
+
+# Three fallback edge cases
+Sticky routing      → only response.model detects (no fallback block for ~1h)
+Mid-stream decline  → content block closes, fallback block, 2nd model continues
+Echo block-by-block → strip thinking + resultless tool_use before last fallback
+                      block, else HTTP 400
 ```
 
 ```
