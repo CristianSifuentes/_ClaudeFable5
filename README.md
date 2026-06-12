@@ -113,6 +113,57 @@ Common pattern:
 ─────────────────────────────────────────────────────
 ```
 
+### Fable 5 vs Mythos 5: Same Engine, Different Gates
+
+Both models share the **exact same underlying architecture**. The difference is what sits in front of it.
+
+```
+Claude Fable 5
+──────────────────────────────────────────────────────────
+[Request] → [Safety Classifier Layer] → [Core Model] → [Response]
+                      ↑
+             Intercepts requests in categories:
+             cybersecurity, biology, and others.
+             When triggered → redirects to Opus 4.8 fallback.
+
+             Think of it as: a building with a security guard.
+             Same building. The guard decides who enters.
+──────────────────────────────────────────────────────────
+✓ Available: all users with API access or compatible subscription
+✓ Self-serve: yes
+```
+
+```
+Claude Mythos 5
+──────────────────────────────────────────────────────────
+[Request] → [Core Model] → [Response]
+
+             Same building. No guard. No classifiers.
+             Maximum capability, no safety interception.
+──────────────────────────────────────────────────────────
+✗ Available: approved organizations only (Project Glasswing)
+✗ Self-serve: no — requires formal access approval
+```
+
+**There is no Claude Haiku 5.** No confirmed model ID exists, and no availability has been published for this generation. If you see it referenced anywhere, there is no documentation to support it.
+
+Both models share the same pricing tier: `$10/M input tokens · $50/M output tokens`.
+
+### Project Glasswing: Access to Mythos 5
+
+Glasswing is the Anthropic program that grants access to Mythos 5 — the classifier-free variant. There are four access paths:
+
+| Path | Self-Serve | Status |
+|---|:---:|---|
+| Partnership with Anthropic account team | No | Active |
+| Claude for Open Source (repo maintainers) | No | Active |
+| **Cyber Verification Program** | **Yes** | **Active** — `claude.com/form/cyber-use-case` |
+| Biology Trusted-Access Program | No | Planned, not yet active |
+
+The Cyber Verification Program is the **only self-serve path into Glasswing today**. It is designed for security professionals doing pentesting, red-teaming, and offensive research who consistently hit the Fable 5 classifier.
+
+For all other use cases, Fable 5 with correct fallback handling is the right path. Mythos 5 is not an upgrade you select for general productivity tasks — it is an access tier with a specific use-case rationale that Anthropic reviews before granting.
+
 ### Agentic vs. Assistant: The Fundamental Distinction
 
 Every previous Claude model — including Opus 4.8 — was an **assistant model**: you ask a question, it answers; you give a task, it completes the next step; you need more, you ask again. The human is the loop.
@@ -513,6 +564,60 @@ This is not an edge case. Any workflow that involves multi-file editing, autonom
 
 **Before committing to a subscription plan for agentic work, run one representative task and measure actual credit consumption.** Then extrapolate to your monthly volume. API/Enterprise pricing is almost always more cost-predictable at scale.
 
+### Confirmed Pricing and Model Specifications
+
+These are the published figures for Claude Fable 5 (and Mythos 5, which shares the same tier):
+
+```
+Pricing
+────────────────────────────────────────
+Input tokens:    $10.00 per million tokens
+Output tokens:   $50.00 per million tokens
+────────────────────────────────────────
+Output is 5× the cost of input.
+
+Context window:  1,000,000 tokens (1M)
+Max output:      128,000 tokens per request
+────────────────────────────────────────
+```
+
+The 1M token context window is the largest in any Anthropic model to date. In practice, this means you can load:
+- An entire large codebase with full history
+- All documentation + tests + CI config simultaneously
+- A year of financial statements in one prompt
+
+The 128K max output per request is the ceiling on a single response. For tasks that require more output than this, you need to structure the work into sequential requests.
+
+### Data Retention Requirement: The Silent 400 Error
+
+**This is the most common silent failure for enterprise deployments.**
+
+Claude Fable 5 requires **30-day data retention** on the Anthropic side. If your organization has `zero-data-retention` (ZDR) enabled on your account, every Fable 5 request returns a `400` error with no model-specific explanation.
+
+```
+Organization setting   →  Result
+────────────────────────────────────────────────────
+Standard (default)     →  Fable 5 works normally
+ZDR enabled            →  HTTP 400 on every request
+────────────────────────────────────────────────────
+Workaround if ZDR required: use Opus 4.8, which
+supports zero-data-retention configurations.
+```
+
+Check your organization's data retention settings before deploying Fable 5. Enterprise security teams often enable ZDR org-wide without realizing it affects model availability.
+
+```python
+# Detect and handle the ZDR 400 silently
+try:
+    response = client.messages.create(model="claude-fable-5", ...)
+except anthropic.BadRequestError as e:
+    if "data retention" in str(e).lower():
+        # Fall back to Opus 4.8 which supports ZDR
+        response = client.messages.create(model="claude-opus-4-8", ...)
+    else:
+        raise
+```
+
 ### Token Pricing Model
 
 Anthropic prices all Claude models on a per-token basis, split between input and output:
@@ -521,7 +626,7 @@ Anthropic prices all Claude models on a per-token basis, split between input and
 Input tokens:  text you send in (prompt + context + tools)
 Output tokens: text the model generates (response + tool calls)
 
-Output tokens are priced 3–5× higher than input tokens.
+Output tokens are priced 5× higher than input tokens.
 ```
 
 #### Cost Estimation Framework
@@ -650,6 +755,216 @@ claude --print "Generate a changelog from git log since v1.2.0"
 
 # Explicitly request Claude Fable 5 (terminal)
 claude --model claude-fable-5
+```
+
+### Model IDs by Platform
+
+**Wrong model IDs fail silently.** A bad ID on some platforms returns a fallback response or a generic 404 with no clear indication that the model was never invoked. Memorize the correct format for each surface before writing a single line of integration code.
+
+#### Claude API (Direct) and Claude Platform on AWS
+
+```python
+# Clean ID — no prefix, no version suffix, in the request body
+response = client.messages.create(
+    model="claude-fable-5",   # ← exact string, no date, no v1.0
+    max_tokens=128000,
+    messages=[{"role": "user", "content": prompt}]
+)
+```
+
+Unlike previous Sonnet IDs (which carried a date stamp and `v1.0` suffix), **Fable does not use a version suffix**. Do not append anything after `claude-fable-5`.
+
+#### Amazon Bedrock
+
+```python
+import boto3
+
+bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+
+# Standard (single-region)
+MODEL_ID = "anthropic.claude-fable-5"
+
+# Cross-region inference (add regional prefix)
+MODEL_ID_US     = "us.anthropic.claude-fable-5"
+MODEL_ID_EU     = "eu.anthropic.claude-fable-5"
+MODEL_ID_GLOBAL = "global.anthropic.claude-fable-5"
+
+response = bedrock.invoke_model(
+    modelId=MODEL_ID_US,
+    body=json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 128000,
+        "messages": [{"role": "user", "content": prompt}]
+    })
+)
+```
+
+Key difference from the direct API: **the `anthropic.` prefix is mandatory**. Without it, Bedrock returns a `ValidationException` that looks like a permissions error.
+
+#### Vertex AI (Google Cloud)
+
+```python
+import anthropic
+
+# On Vertex, the model ID goes in the URL path — not the body
+client = anthropic.AnthropicVertex(
+    region="us-east5",
+    project_id="YOUR_PROJECT_ID"
+)
+
+# The model string is still claude-fable-5, but Vertex
+# routes it differently from the direct API internally.
+response = client.messages.create(
+    model="claude-fable-5",
+    max_tokens=128000,
+    messages=[{"role": "user", "content": prompt}]
+)
+```
+
+The ID looks the same as the direct API, but the routing is different: the SDK constructs a URL path from the model name. A body-level `model` parameter override does not work the same way it does on the direct API.
+
+#### Microsoft Azure AI Foundry
+
+```python
+import openai  # Foundry uses the OpenAI-compatible endpoint
+
+client = openai.AzureOpenAI(
+    azure_endpoint="https://YOUR_ENDPOINT.openai.azure.com/",
+    api_key=os.environ["AZURE_API_KEY"],
+    api_version="2024-12-01-preview"
+)
+
+# model= points to your DEPLOYMENT NAME, not the model ID directly
+# You named this deployment yourself when you set it up in the portal.
+response = client.chat.completions.create(
+    model="YOUR_DEPLOYMENT_NAME",   # ← the name YOU chose at creation
+    messages=[{"role": "user", "content": prompt}]
+)
+```
+
+**Critical Foundry constraint: deployment names cannot be changed after creation.** Once you create a deployment named `prod-fable-v1`, that name is permanent. Choose naming conventions carefully — they will outlast the model version.
+
+#### Model ID Summary Table
+
+| Platform | Model ID / Parameter | Where it goes | Notes |
+|---|---|---|---|
+| Claude API direct | `claude-fable-5` | Request body `model` | No prefix, no suffix |
+| Claude Platform on AWS | `claude-fable-5` | Request body `model` | Same as direct API |
+| Amazon Bedrock (single-region) | `anthropic.claude-fable-5` | Request body `modelId` | Provider prefix required |
+| Amazon Bedrock (cross-region) | `us.anthropic.claude-fable-5` | Request body `modelId` | Regional prefix + provider prefix |
+| Vertex AI | `claude-fable-5` | SDK constructs URL path | Not in request body |
+| Microsoft Azure AI Foundry | your deployment name | Request body `model` | Points to deployment, not model |
+
+### Platform Feature Matrix
+
+Features that seem universal are not. Before committing to a platform for production, verify these specific capabilities are available there.
+
+#### Feature Availability by Platform
+
+| Feature | Claude API | Bedrock | Vertex AI | Azure Foundry |
+|---|:---:|:---:|:---:|:---:|
+| **Thinking** | GA | GA | GA | GA |
+| **Effort levels** (low → max) | GA | GA | GA | GA |
+| **Server-side fallback** (auto Opus 4.8) | GA | — | — | — |
+| **Programmatic tool calling** | GA | — | — | Beta |
+| **Code execution** | GA | — | — | Beta |
+| **Prompt caching** | GA (512 tok min) | GA (1024 tok min) | GA (512 tok min) | Beta |
+| **Automatic caching** | Yes | No | Yes | Beta |
+| **Streaming** | GA | GA | GA | GA |
+
+**Legend:** GA = Generally Available · — = Not available · Beta = Available but not production-stable
+
+#### Thinking and Effort: Consistent Everywhere
+
+The `thinking` capability is always active on Fable 5 across all platforms. The `effort` parameter accepts five levels: `low`, `medium`, `high`, `very_high`, `max`. Display mode is either `omitted` (thinking hidden from output) or `summarized` (brief summary shown).
+
+```python
+# Works identically on all four platforms
+response = client.messages.create(
+    model="claude-fable-5",
+    max_tokens=128000,
+    thinking={
+        "type": "enabled",
+        "budget_tokens": 10000,  # tokens allocated to internal reasoning
+        "effort": "high",
+        "display": "omitted"     # or "summarized"
+    },
+    messages=[{"role": "user", "content": prompt}]
+)
+```
+
+#### Server-Side Fallback: API Only
+
+**Server-side automatic fallback to Opus 4.8 only works on the Claude API direct and Claude Platform on AWS.** On Bedrock, Vertex, and Foundry, if the safety classifier triggers, the request fails — there is no automatic routing.
+
+For non-API platforms, implement fallback in your application layer:
+
+```python
+def call_with_fallback(prompt: str, platform: str) -> str:
+    primary_model = get_model_id("claude-fable-5", platform)
+    fallback_model = get_model_id("claude-opus-4-8", platform)
+
+    try:
+        response = call_model(primary_model, prompt)
+        if is_safety_blocked(response):
+            logger.warning("Safety classifier triggered, falling back")
+            return call_model(fallback_model, prompt)
+        return response
+    except ModelNotAvailableError:
+        return call_model(fallback_model, prompt)
+```
+
+#### The Foundry Fallback Context Window Collapse
+
+**This is a Foundry-specific edge case that affects no other platform.**
+
+When Fable 5 falls back to Opus 4.8 inside Azure AI Foundry, the context window **drops from 1,000,000 tokens to 200,000 tokens**. This does not happen on the direct API, Bedrock, or Vertex.
+
+```
+Platform     Fable 5 context   After fallback to Opus 4.8
+─────────────────────────────────────────────────────────
+Claude API   1,000,000 tokens  200,000 tokens (standard)
+Bedrock      1,000,000 tokens  200,000 tokens (standard)
+Vertex AI    1,000,000 tokens  200,000 tokens (standard)
+Foundry      1,000,000 tokens  200,000 tokens ← SAME drop, but
+                                silently — no notification
+─────────────────────────────────────────────────────────
+```
+
+If you are running long-context tasks on Foundry and a fallback triggers mid-session, **context that fit at 1M tokens will silently truncate** at 200K on the fallback. Detect fallbacks on Foundry explicitly and handle the context window reduction.
+
+#### Prompt Caching: Platform Differences
+
+```
+Platform      Minimum cacheable tokens   Automatic caching
+────────────────────────────────────────────────────────────
+Claude API    512 tokens                 Yes — no manual annotation
+Bedrock       1,024 tokens               No — must use cache_control
+Vertex AI     512 tokens                 Yes — no manual annotation
+Foundry       Beta — subject to change   Beta
+────────────────────────────────────────────────────────────
+```
+
+If you rely on prompt caching to control costs, Bedrock's 1024-token minimum and lack of automatic caching means you need to annotate cache boundaries manually using `cache_control`:
+
+```python
+# Bedrock — explicit cache_control annotation required
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": your_long_system_context,
+                "cache_control": {"type": "ephemeral"}  # required on Bedrock
+            },
+            {
+                "type": "text",
+                "text": user_query
+            }
+        ]
+    }
+]
 ```
 
 ### Verifying You Are Actually Running Claude Fable 5
@@ -1329,6 +1644,40 @@ Opus 4.8:  34.3%
 # Financial work preference (head-to-head)
 Fable 5 preferred: 74% of evaluations
 Token efficiency:  ~50% of Opus 4.8 token consumption for equivalent results
+
+# Confirmed pricing
+Input:    $10.00 / million tokens
+Output:   $50.00 / million tokens
+Context:  1,000,000 tokens
+Max out:  128,000 tokens per request
+```
+
+```
+# Model IDs by platform — use exactly as shown
+Claude API direct         →  claude-fable-5
+Claude Platform on AWS    →  claude-fable-5
+Bedrock (single-region)   →  anthropic.claude-fable-5
+Bedrock (cross-region)    →  us.anthropic.claude-fable-5
+                             eu.anthropic.claude-fable-5
+                             global.anthropic.claude-fable-5
+Vertex AI                 →  claude-fable-5  (in URL path via SDK)
+Azure AI Foundry          →  YOUR_DEPLOYMENT_NAME  (not the model ID)
+
+# Feature gaps by platform
+Server-side fallback      →  API + Claude on AWS only
+Tool calling (GA)         →  API only  (Foundry: beta)
+Code execution (GA)       →  API only  (Foundry: beta)
+Auto prompt caching       →  API + Vertex  (Bedrock: manual only, 1024 tok min)
+Foundry fallback penalty  →  Context drops 1M → 200K on Opus 4.8 fallback
+
+# Data retention gotcha
+ZDR org setting enabled   →  Fable 5 returns HTTP 400 silently
+Fix                       →  Use Opus 4.8, or disable ZDR for API traffic
+
+# Fable 5 vs Mythos 5
+Fable 5    →  classifiers on, self-serve, all platforms
+Mythos 5   →  no classifiers, Project Glasswing only
+Glasswing self-serve path →  claude.com/form/cyber-use-case
 ```
 
 ```bash
