@@ -1429,6 +1429,8 @@ The top-level model field tells you which model served the request.
 Signal 2: content[].type == "fallback"
 ────────────────────────────────────────────────────────────
 A block of type "fallback" in the content array signals a switch occurred.
+It carries `from` and `to` fields telling you exactly where the switch
+happened (e.g. from: "claude-fable-5", to: "claude-opus-4-8").
 If absent, the named model ran to completion.
 
 Signal 3: usage.iterations (most reliable)
@@ -1716,6 +1718,106 @@ All of the above + dense
 ```
 
 Practical rule: if you are working with complex multimodal inputs in any language, clean and structure your inputs aggressively before passing them. Clear column headers, no merged cells, labeled images, and clean OCR output produce consistently better results than raw, messy uploads.
+
+### Reading Benchmarks Critically: The Asterisk Behind Every Number
+
+When you see "95.5% on SWE-bench Verified," it reads like definitive proof of capability. It is not — at least not for the model you run in production. That number was almost certainly measured on **Mythos 5**, the version *without* safety classifiers, not on **Fable 5**, the version that actually answers your requests. This section gives you a framework to tell real evidence from marketing.
+
+#### The Software Engineering Benchmark Taxonomy
+
+Four evaluations dominate software-engineering claims, and each measures something different. Knowing which is which keeps you from comparing apples to oranges.
+
+| Benchmark | What it does | What it actually tests |
+|---|---|---|
+| **SWE-bench Verified** | 500 real GitHub issues *confirmed solvable*; model must produce a patch that passes the repo's tests | Can it read a real bug report and produce a working fix? |
+| **SWE-bench Pro** | Active repositories, multi-file changes | Same, with reduced training-data contamination |
+| **SWE-bench Multilingual** | Extends the test across nine languages | Cross-language code competence |
+| **SWE-bench Multimodal** | Adds screenshots to the context | Visual + code reasoning |
+| **FrontierCode** (Cognition) | 150 tasks from real PRs — broken websocket, bundle hardening, linting-rule extension | **Code quality**, not just whether the test passes |
+| **Terminal-Bench 2.1** | Places the model inside a real shell, executing commands and navigating the system | End-to-end operational competence |
+| **CursorBench** | Derived from real developer usage inside Cursor | Real-world editor-assisted productivity |
+
+A few concrete results worth anchoring on:
+
+```
+FrontierCode — Diamond subset
+──────────────────────────────────────────
+Fable 5     29.3%   ██████████████████░░░░░░░░░░░░░░░░
+GPT 5.5      5.7%   ███░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+──────────────────────────────────────────
+
+CursorBench (at maximum effort)
+──────────────────────────────────────────
+Fable 5     72.9%
+──────────────────────────────────────────
+```
+
+The key distinction: **SWE-bench asks "did the test pass?" FrontierCode asks "is this code you would actually ship?"** A model can score well on the former and still produce code that no senior engineer would merge.
+
+#### Math & Reasoning: How Far From Genuine Research
+
+Reasoning benchmarks span a spectrum from high-school competitions to active research frontiers — and the scores reveal how much headroom still exists. Note that the headline numbers below are reported for **Mythos 5**, the unclassified version (the asterisk is explained next).
+
+| Benchmark | What it measures | Mythos 5 |
+|---|---|---|
+| **USAMO 2026** | Formal multi-step proofs (not numeric answers) | 99.8% |
+| **ArxivMath** | Problems from Mar–Apr 2026 academic papers (avoids contamination) | 78.5% |
+| **RiemannBench** | 25 problems written by researchers about their own work; avg of 4 attempts each | — |
+| **CritPt** | Simulated research projects across 11 physics subfields | 28.6% |
+
+The 28.6% on CritPt is the honest data point. It shows how far even a frontier model is from *genuine research-grade reasoning* — the bar isn't "passes a hard exam," it's "advances an open problem," and that bar is still mostly unmet.
+
+#### The Asterisk: Mythos 5 Is Not Fable 5
+
+Look closely at the reasoning table above. The name attached to those scores is **Mythos 5**, not Fable 5. That is the asterisk that changes how you read every benchmark.
+
+```
+The car-manufacturer analogy
+──────────────────────────────────────────────────────────────
+Published top speed   →  measured on a closed track, with the
+                         stripped-down race version
+What you can buy       →  the street version, fully loaded with
+                         every safety system
+──────────────────────────────────────────────────────────────
+Same headline number. Different machine under the hood.
+```
+
+- **Mythos 5** — the version *without* safety classifiers. This is what most published benchmarks evaluate.
+- **Fable 5** — what arrives when *you* make a request. It has a classifier layer on top that intercepts, blocks, and redirects.
+
+Same name in the headline; different machine answering your traffic. (See [Section 2 — Fable 5 vs Mythos 5](#fable-5-vs-mythos-5-same-engine-different-gates) for the access and gating details.)
+
+#### How the Safety Layer Changes Real Numbers
+
+The gap between the evaluated model and the production model is not theoretical. It shows up in hard numbers:
+
+| Benchmark | Mythos 5 (unclassified) | Fable 5 (production) |
+|---|---|---|
+| **ExploitBench** | 78% | ~40% — cybersecurity queries are redirected to Opus 4.8 |
+| **BioMysteryBench** | (score exists) | No score — the classifier intercepts most biology queries before the model answers |
+| **ProgramBench** (binary behavior reconstruction) | (score exists) | No number reported for Fable 5 |
+| **Offensive cybersecurity tasks** | (capable) | **0% progress** with safeguards active |
+
+On ExploitBench, the production model scores roughly *half* of the evaluated model — because the classifier reroutes those queries to Opus 4.8, which scores 40%. The benchmark you read about and the model you deploy are, for whole categories of work, not the same system.
+
+#### The Five Questions to Ask Any Benchmark
+
+Before trusting any benchmark number, ask:
+
+1. **Which exact model version was tested?** (Mythos 5 or Fable 5? Classified or not?)
+2. **What effort and sampling configuration was used?** (`max` effort inflates scores vs. production defaults.)
+3. **Were the safeguards active?** (Production has them; the eval often doesn't.)
+4. **How many attempts were averaged?** (Best-of-N hides single-shot reliability.)
+5. **Where did the competitors' numbers come from?** (Self-reported? Same conditions? Cherry-picked?)
+
+```
+If any answer is missing → the number is marketing, not evidence.
+
+A launch-day bar chart is the START of your questions,
+not the conclusion.
+```
+
+This is exactly why response-level instrumentation matters: the only way to know which model actually served a given turn — and therefore which benchmark profile applies — is to read `response.model`, the fallback content block, and `usage.iterations` (see [Section 5 — Verifying You Are Actually Running Claude Fable 5](#verifying-you-are-actually-running-claude-fable-5)). Without it, sticky routing means even your *own* production metrics can silently attribute Opus 4.8 answers to Fable 5.
 
 ### Capability Matrix
 
@@ -2144,6 +2246,11 @@ Max plan ($100) agentic burn rate   →  6-hour allocation in ~20 minutes
 # FrontierCode benchmark
 Fable 5:   46.3%  (+12pp vs Opus 4.8)
 Opus 4.8:  34.3%
+Fable 5 (Diamond subset):  29.3%  vs GPT 5.5: 5.7%
+
+# Other benchmark anchors
+CursorBench (max effort):  Fable 5 72.9%
+Mythos 5 USAMO 2026:       99.8%   |  ArxivMath: 78.5%  |  CritPt: 28.6%
 
 # Financial work preference (head-to-head)
 Fable 5 preferred: 74% of evaluations
@@ -2182,6 +2289,23 @@ response.usage.iterations         →  full attempt history (survives sticky rou
 # Sticky routing
 After any fallback: system routes to Opus 4.8 for ~1 hour silently
 Only usage.iterations reveals this — no fallback block appears
+```
+
+```
+# The benchmark asterisk — Mythos 5 ≠ Fable 5
+Published benchmarks usually test MYTHOS 5 (no safety classifiers).
+Production requests hit FABLE 5 (classifier layer intercepts/redirects).
+  ExploitBench:  Mythos 5 78%  →  Fable 5 ~40% (rerouted to Opus 4.8)
+  Offensive cybersecurity:    Fable 5 0% with safeguards active
+  BioMysteryBench / ProgramBench:  no Fable 5 score (intercepted)
+
+# Five questions before trusting any benchmark number
+1. Which exact model version was tested? (Mythos 5 or Fable 5?)
+2. What effort + sampling config? (max effort inflates scores)
+3. Were safeguards active?
+4. How many attempts were averaged? (best-of-N hides reliability)
+5. Where did competitors' numbers come from?
+Any answer missing → it's marketing, not evidence.
 ```
 
 ```
