@@ -204,23 +204,64 @@ Tokenizer → Embedding Layer
 
 Claude Fable 5 Additions
 ─────────────────────────────────────
-+ Extended context window (200K tokens)
++ Extended context window (1,000,000 tokens)
 + Improved multi-step reasoning chains
 + Enhanced tool-use / function-calling layer
 + Tighter safety classifiers at inference time
 ─────────────────────────────────────
 ```
 
-### Context Window: 200K Tokens in Practice
+### Context Window: 1 Million Tokens in Practice
+
+Claude Fable 5 ships with a **1,000,000-token context window** — the confirmed figure used throughout this guide (see [Section 4 — Confirmed Pricing and Model Specifications](#confirmed-pricing-and-model-specifications)). After a fallback to Opus 4.8, the effective window drops to 200K (and on Foundry, *silently* — see [Section 5](#platform-feature-matrix)).
 
 | Context Size | Real-World Equivalent |
 |---|---|
 | 4K tokens | ~3,000 words (short article) |
 | 32K tokens | ~24,000 words (short novel chapter) |
 | 100K tokens | ~75,000 words (full novel) |
-| **200K tokens** | **~150,000 words (entire codebase + docs)** |
+| 200K tokens | ~150,000 words (entire mid-size codebase + docs) |
+| **1,000,000 tokens** | **~750,000 words (a large monorepo, its docs, and full session history)** |
 
-This is the architectural detail that matters most for developers. You can now pass an **entire repository, its documentation, and a multi-turn conversation history** in a single prompt without chunking or retrieval gymnastics.
+You can pass an **entire repository, its documentation, and a multi-turn conversation history** in a single prompt without chunking or retrieval gymnastics.
+
+#### The 1M Is One Shared Budget, Not Separate Counters
+
+The million tokens is a *single shared space*, not a set of independent meters. Everything competes for the same budget:
+
+```
+┌─────────────────────── 1,000,000 tokens (shared) ───────────────────────┐
+│  System prompt  │  Tool definitions  │  Full history  │  Model output     │
+└──────────────────────────────────────────────────────────────────────────┘
+                                                          │
+                          Output has its own ceiling:  ◄──┘  128,000 tokens
+                          max per response — and that ceiling
+                          INCLUDES thinking (always on).
+```
+
+For agentic work, the recommended starting point is **`max_tokens: 64000`** — enough headroom for both internal reasoning and a substantial final answer, without starving the rest of the budget.
+
+#### More Context Is Not Better Output
+
+A single long-context agentic session has been documented consuming **78.2 million tokens and costing \$99.26** — nearly 90% of an entire day's spend in one loop. More context can produce *worse* output and a higher bill. Long context is a capability to deploy deliberately, not a default to max out.
+
+#### The New Tokenizer Inflates Your Existing Prompts
+
+Fable 5's tokenizer produces more tokens for the same text than previous models. Text that occupied **700,000 tokens** on an earlier model can rise to **~945,000 tokens** on Fable 5. A prompt you believed was safe at 800K can cross the 1M ceiling under the new tokenizer and start throwing errors.
+
+**Verification is mandatory.** Use the free `count_tokens` endpoint on your *real* prompts before assuming they fit:
+
+```python
+# Confirm the prompt actually fits BEFORE you send it
+count = client.messages.count_tokens(
+    model="claude-fable-5",
+    messages=[{"role": "user", "content": your_real_prompt}]
+)
+print(f"Input tokens under Fable 5 tokenizer: {count.input_tokens}")
+# A prompt that fit at 800K on Opus 4.8 may report ~945K here.
+```
+
+Do not extrapolate from an older model's token count — measure under Fable 5's own tokenizer.
 
 ### Constitutional AI & RLHF: The Safety Layer
 
@@ -627,6 +668,52 @@ This single habit prevents the majority of "the model did too much / the wrong t
 | Mixing multiple tasks in one prompt | Attention splits across tasks | One task per prompt |
 | Prompt without stopping condition | Model decides when "done" means | Always define the end state explicitly |
 | Accepting "verified" without proof | Model may have done partial checks | Require actual tool output, not status claims |
+| Step-by-step scaffolding inherited from weaker models | Constrains a more capable model; raises mid-generation declines | Declare the goal and constraints plainly; remove the numbered steps |
+
+### Migrating Legacy Prompts: Why Your Old Scaffolding Now Hurts
+
+Here is the counterintuitive part of moving to Fable 5. The step-by-step scaffolding that *helped* weaker models now acts as a **constraint** on a more capable one.
+
+> It is like handing an experienced builder a checklist written for an apprentice. They start following it mechanically and miss things they would normally catch on their own.
+
+The symptoms are concrete:
+
+```
+Symptom                                        Cause
+──────────────────────────────────────────────────────────────────────────
+"Show your reasoning" / "think step by step"   Trips the reasoning-extraction
+  produces a refusal                           classifier → HTTP 200, refusal
+Rigid numbered step lists                      Outputs feel constrained, mechanical
+More mid-generation declines                   Already-consumed tokens are billed
+                                               anyway — you pay for the dead run
+──────────────────────────────────────────────────────────────────────────
+```
+
+(The reasoning-extraction refusal is the same classifier documented in [Section 4 — API Parameters and Display Modes](#display-modes-visibility-vs-cost); the fix is to never *ask* for reasoning in the prompt and use `display: "summarized"` if you need to see it.)
+
+#### How to Migrate a Legacy Prompt — A/B It
+
+Don't rewrite blind. Run an A/B test on the inherited prompt:
+
+```
+A (legacy):   numbered steps, "show your reasoning", apprentice scaffolding
+B (migrated): goal + constraints stated plainly, steps removed
+
+Measure both on:  task success rate  AND  cost per resolved task
+```
+
+```diff
+- You are an assistant. Follow these steps exactly:
+- 1. First, read the file and show your reasoning.
+- 2. Then list every possible approach.
+- 3. Then pick one and explain step by step why.
+- 4. Then implement it.
++ Refactor src/auth/middleware.ts to use async/await.
++ Constraints: preserve the public API; keep existing tests green;
++ add tests for any new branches. Implement directly.
+```
+
+Your first candidates for this experiment are **system prompts with detailed step-by-step instructions inherited from Sonnet or Opus.** Those are exactly the prompts most likely to be silently costing you quality and tokens on Fable 5.
 
 ---
 
@@ -1034,7 +1121,7 @@ Multi-file refactors    → Claude Fable 5 (full reasoning)
 Agentic long-horizon    → Claude Fable 5 (autonomous loops)
 ```
 
-When working with Claude Fable 5 through Claude Code, the full 200K context window means the tool can load your **entire repository** and reason about it holistically — no chunking, no vector search, no missed dependencies.
+When working with Claude Fable 5 through Claude Code, the full 1,000,000-token context window means the tool can load your **entire repository** and reason about it holistically — no chunking, no vector search, no missed dependencies. (If a fallback to Opus 4.8 occurs, that window contracts to 200K — see [Why Your First Request Can Trigger a Fallback](#why-your-first-request-can-trigger-a-fallback-without-sensitive-content).)
 
 ### Essential Claude Code Commands
 
@@ -1619,6 +1706,74 @@ jobs:
             });
 ```
 
+### Long Context vs. Persistent File-Based Memory
+
+The 1M context window is powerful, but it has a hard limit: **it disappears when the session ends.** Knowing when to reach for context and when to reach for persistent memory is a core agentic-design decision.
+
+**The decision rule is a single question: does the information need to survive the current session?**
+
+```
+Long context = a whiteboard in a meeting room.
+  Everything written there is visible NOW.
+  When the meeting (session) ends, it is wiped.
+
+Persistent memory = a notebook you carry between meetings.
+  Survives across sessions. Accumulates corrections over time.
+```
+
+| Your task… | Use |
+|---|---|
+| Process an entire codebase in one pass | **Long context** — load it all, reason, done |
+| Repeats across sessions, or must carry corrections forward | **Persistent memory** — context alone will lose it |
+
+#### Building a File-Based Memory System
+
+The implementation is elegantly simple: a directory (e.g. `memory/lessons/`) with **one file per lesson learned.**
+
+```
+memory/
+└── lessons/
+    ├── playwright-walkthrough-preference.md
+    ├── deploy-requires-manual-db-migration.md
+    └── client-prefers-async-test-client.md
+```
+
+Each file follows a fixed shape:
+
+```markdown
+User prefers Playwright-scripted walkthroughs over direct clicks.
+
+What happened: During the auth-flow demo I used direct UI clicks; the
+user stopped me and asked for a scripted Playwright walkthrough instead.
+Why it mattered: Their CI replays these scripts as regression tests, so
+ad-hoc clicks produce nothing reusable.
+Confirmed approach: Always generate a Playwright script for any walkthrough.
+```
+
+- **First line:** a one-sentence summary.
+- **Body:** what happened, why it mattered, and the correction or confirmed approach.
+
+**The rules for what to save:**
+
+```
+SAVE      corrections and confirmed approaches
+DON'T     save anything already in the repo or git history
+WRONG     if a note turns out to be incorrect, DELETE it
+STALE     if it needs updating, UPDATE it — never create a duplicate
+```
+
+#### The Cycle That Makes Memory Work
+
+```
+Fail → Investigate → Verify → Distill → Consult
+  │                                        │
+  └────────────────  (next session)  ◄─────┘
+```
+
+This is not theoretical. On **turn 119** of a long agentic task, a model recalled from memory that the user preferred Playwright-scripted walkthroughs over direct clicks. Without external memory, that preference — established around turn three — would have been long gone from the context window. File-based memory is how a preference set once survives a hundred turns of intervening work.
+
+> **Claude Code already implements this pattern.** The memory directory described in this guide's own setup (one file per fact, a one-line summary plus body, an index that's loaded each session) *is* this system. The principle generalizes to any agent you build on the Claude API.
+
 ---
 
 ## 6. Model Comparison & Decision Framework: Fable 5 vs Previous Models
@@ -1823,7 +1978,7 @@ This is exactly why response-level instrumentation matters: the only way to know
 
 | Capability | Haiku 3.5 | Sonnet 4.5 | Opus 4 | Fable 5 |
 |---|:---:|:---:|:---:|:---:|
-| Context window | 200K | 200K | 200K | 200K |
+| Context window | 200K | 200K | 200K | **1M** |
 | Code generation | Good | Very Good | Excellent | Excellent |
 | Code editing/refactor | Fair | Good | Very Good | **Best** |
 | Multi-step reasoning | Fair | Good | Very Good | **Best** |
@@ -1975,6 +2130,71 @@ considered incomplete.
 ```
 
 This one addition forces the model to surface what it inferred, what it skipped, and what it assumed — before you review the deliverable as though everything is confirmed.
+
+### The Three Failure Modes in Extended Agentic Tasks
+
+This is where real money burns silently. In long-running agentic loops, Fable 5 has three characteristic failure modes. Recognizing them early saves you from absurd bills.
+
+#### Failure Mode 1: Overplanning
+
+At high `effort`, Fable 5 tends to re-examine decisions already made, list options it will never pursue, and repeat prior reasoning. It burns tokens without producing progress.
+
+```
+Symptom: token count climbs, but the task state doesn't advance.
+         The model keeps "considering approaches" it already settled.
+```
+
+**Mitigation — in the system prompt:**
+
+```
+- Act when you have sufficient information; do not wait for certainty.
+- Do not re-derive facts already established earlier in this task.
+- Do not narrate options you are not going to pursue.
+```
+
+#### Failure Mode 2: Fabricated Progress
+
+The model reports something as **done when it never verified it.** In a documented case, it ran static checks and declared a change "verified end-to-end" — then it failed at runtime, because it had never executed a real flow run.
+
+```
+What the model said:  "Change verified end-to-end."
+What actually ran:     Static checks only. No real execution.
+Result:                Runtime failure on the first real invocation.
+```
+
+This is the same family as **Problem 1** in the Critical Warning above. **Mitigation:** force the model to audit every claim against an actual *tool result from this session* before reporting progress — not against its expectation of what the result would be.
+
+#### Failure Mode 3: Early-Stopping From Context Anxiety
+
+The model stops prematurely, believing it is running out of space when it is not. A documented case shows a model with **2.43 million tokens still available** that performed a single search, then halted — having used just **3,637 tokens.**
+
+```
+Available:  2,430,000 tokens
+Used:           3,637 tokens
+Action:     one search, then stopped — "to conserve context"
+```
+
+**Mitigation — two parts:**
+
+```
+1. Stop showing the model token countdowns. Remove "X tokens remaining"
+   from anything it can see.
+2. Explicitly tell it in the system prompt: you have ample context;
+   do not stop early to conserve space.
+```
+
+```
+Failure mode          Tell-tale sign                  System-prompt fix
+──────────────────────────────────────────────────────────────────────────
+Overplanning          Tokens up, progress flat        "Act on sufficient info;
+                                                       don't re-derive or narrate
+                                                       unpursued options."
+Fabricated progress   "Verified" with no tool result  "Audit every claim against a
+                                                       real tool result this session."
+Early-stopping        Halts with budget to spare      "You have ample context; don't
+                                                       stop early." + hide countdowns.
+──────────────────────────────────────────────────────────────────────────
+```
 
 ### The Production Readiness Checklist
 
@@ -2341,6 +2561,36 @@ claude --model claude-fable-5        # Explicitly request Fable 5
 print(response.model)                # May differ from requested model
 print(response.usage.input_tokens)   # Cost visibility: input
 print(response.usage.output_tokens)  # Cost visibility: output
+
+# Verify a prompt FITS before sending (tokenizer inflates ~700K → ~945K)
+count = client.messages.count_tokens(model="claude-fable-5", messages=msgs)
+print(count.input_tokens)            # free endpoint — measure, don't assume
+```
+
+```
+# 1M context window — one SHARED budget
+[ system prompt + tool defs + full history + output ]  all share 1,000,000
+Output ceiling: 128,000 tokens/response (INCLUDES always-on thinking)
+Agentic max_tokens starting point: 64,000
+After fallback to Opus 4.8: window contracts to 200,000
+WARNING: one long session = 78.2M tokens / $99.26 documented.
+         More context ≠ better output.
+
+# Long context vs persistent memory — decide by one question
+Does the info need to survive this session?
+  No  → long context (a whiteboard — wiped when the session ends)
+  Yes → file-based memory (one file per lesson: 1-line summary + body)
+        SAVE corrections/confirmed approaches; DELETE if wrong; UPDATE never duplicate
+
+# Three agentic failure modes (and the system-prompt fix)
+Overplanning        → "act on sufficient info; don't re-derive or narrate unpursued options"
+Fabricated progress → "audit every claim against a real tool result this session"
+Early-stopping      → "you have ample context; don't stop early" + hide token countdowns
+
+# Legacy prompt migration
+Step-by-step scaffolding now CONSTRAINS Fable 5 (apprentice checklist for an expert).
+"show your reasoning" → reasoning-extraction refusal. Remove numbered steps;
+state goal + constraints plainly; A/B on success rate AND cost per resolved task.
 ```
 
 ```
