@@ -347,6 +347,45 @@ Fable 5 classification request (max_tokens=256):
 
 If you have tasks where `max_tokens` was tuned tightly for Opus 4.8, audit them before migrating. Diagnose by reading `usage.output_tokens_details.thinking_tokens` — if it is consuming the majority of your allocated tokens, either raise `max_tokens` or lower `effort` for that route.
 
+### Output Effort: Controlling How Much Fable 5 Thinks
+
+Adaptive thinking establishes *that* Fable 5 always reasons before responding. `output_config.effort` controls *how much* it reasons — and it is the single most consequential cost decision you make on every request.
+
+Extending the engine analogy from the previous section: thinking is the engine that's always running. `display` is the window you look through to see the exhaust. `effort` is the throttle — it determines how many RPMs the engine runs at before producing output.
+
+```python
+response = client.messages.create(
+    model="claude-fable-5",
+    max_tokens=8192,
+    output_config={
+        "effort": "high"   # low | medium | high (default) | xhigh | max
+    },
+    messages=[{"role": "user", "content": prompt}]
+)
+```
+
+**`effort` is not `display`, and neither is a substitute for "think step by step" in the prompt:**
+
+| | Controls | Changes your bill? | Reliability |
+|---|---|---|---|
+| `display` | What portion of reasoning you *see* | No — billing is identical | Formal API parameter |
+| `effort` | How much reasoning actually *happens* | Yes — directly | Formal API parameter |
+| "Think step by step" in prompt | A soft suggestion the model may ignore | Indirectly, unreliably | Soft steering — not guaranteed |
+
+Effort is measurable and consistent across calls. Prompt-based steering is not — the model can simply ignore it.
+
+**The five effort levels:**
+
+| Level | Behavior | Best for |
+|---|---|---|
+| `low` | Minimizes thinking; skips it entirely on simple tasks | High-volume routes, fast subagents, triage |
+| `medium` | Skips thinking on trivial queries, engages it when the task warrants | General-purpose default for mixed workloads |
+| `high` (default) | Thinks on nearly every request | Recommended starting point for most production tasks |
+| `xhigh` | Always thinks, with extended exploration | Long-horizon coding, complex agentic tasks |
+| `max` | Unrestricted reasoning, no depth limit | Latency-insensitive, maximum-quality-only problems |
+
+**The counterintuitive part:** per Anthropic's documentation, `low` effort on Fable 5 frequently *outperforms* `xhigh` on previous-generation models. Fable 5 starts from a higher capability floor, so dropping a level does not automatically mean a worse result. This breaks the reflexive habit of defaulting every request to `max` "just to be safe" — that habit is now a budget decision, not a quality one.
+
 ---
 
 ## 3. Advanced Prompting Techniques for Claude Fable 5
@@ -856,6 +895,71 @@ What you NEVER receive, under any configuration:
   This is not configurable.
 ```
 
+### Output Effort Levels: The 7x Cost Spread
+
+Same task, same model, same endpoint — the only difference is `output_config.effort`. The real-world spread between the cheapest and most expensive setting on an identical task is approximately **7x**.
+
+```
+Example: a single task run at each effort level
+low      → $0.09
+max      → $0.72
+                                          ~8x spread on this task
+```
+
+Because thinking tokens are billed **regardless of `display` mode**, `effort` is the lever — not visibility settings.
+
+**Why Fable 5 costs even more than the per-token price suggests:**
+
+```
+Fable 5's tokenizer produces  ~30% more tokens  than Opus 4.8 for the same content
+Fable 5's per-token price is  2×                Opus 4.8's price
+                              ─────────────────────────────────────
+Compound multiplier:          ~2.5×             before `effort` is even considered
+```
+
+Stack the ~2.5x tokenizer/pricing multiplier with the ~7x spread between effort levels, and `effort` stops being a minor tuning knob — it becomes your primary budget control.
+
+**Choosing `effort` per step in a workflow:**
+
+Not every step in a pipeline needs the same depth. A triage step is fast and repetitive; an implementation step is where depth pays off.
+
+```python
+# Triage: classify and route — cheap, high-volume
+triage = client.messages.create(
+    model="claude-fable-5",
+    output_config={"effort": "low"},
+    messages=[{"role": "user", "content": triage_prompt}]
+)
+
+# Implementation: the step where reasoning depth matters
+implementation = client.messages.create(
+    model="claude-fable-5",
+    output_config={"effort": "xhigh"},
+    messages=[{"role": "user", "content": implementation_prompt}]
+)
+```
+
+**Finding the optimal effort level per route — run a sweep:**
+
+For each task type in your pipeline (e.g., code review, ticket classification, refactoring), run it against every effort level and collect:
+
+1. Output quality
+2. Total tokens consumed
+3. Thinking tokens consumed
+4. `stop_reason`
+
+```
+The metric that matters is NOT cost per request.
+It is cost per COMPLETED task:
+
+  cost_per_completed_task = cost_per_attempt / success_rate
+
+A cheap model that fails often can cost more than an
+expensive model that succeeds on the first try.
+```
+
+Run this sweep against your highest-traffic production route. The question worth asking: does it actually need `high`, or would `medium` resolve it just as well? Routes left on the `high` default without ever being measured are the most common source of "we're paying more than expected" surprises.
+
 ### The Expensive Mistakes (and How to Avoid Them)
 
 | Mistake | Cost Impact | Fix |
@@ -863,6 +967,7 @@ What you NEVER receive, under any configuration:
 | Passing full codebase on every turn | High — input tokens × turns | Cache static context; only pass diffs |
 | Streaming without token counting | No visibility into spend | Log token usage per request |
 | Using Fable 5 for simple classification | Overkill — 2× Opus price for a haiku-level task | Route simple tasks to Haiku 3.5 |
+| Leaving `effort` at its `high` default everywhere | Up to ~7x more expensive than necessary on simple routes | Sweep effort levels per route; measure cost per completed task |
 | Retrying on hallucination instead of constraining | Doubles cost for the same task | Add output validation before retry |
 | Ignoring context window limits | Truncation = invisible data loss | Always track token count in context |
 | Vague prompts requiring multiple clarification rounds | Each round = full context retokenized | Use the Four-Component Framework upfront |
@@ -1191,6 +1296,50 @@ Instead of hardcoding a model name in your project settings file, use the `best`
 ```
 
 `best` resolves to the most capable model each team member has access to. Engineers with Fable 5 access get Fable 5. Those without fall back to Opus without errors or broken builds. No one needs to manually manage model IDs per environment.
+
+### Configuring Output Effort for Subagents: The `CLAUDE_CODE_EFFORT_LEVEL` Override
+
+Claude Code subagents declare their own `effort` level in their frontmatter — letting you give a triage subagent `low` and an implementation subagent `xhigh`, mirroring the per-step pattern from the effort discussion in [Section 4](#4-pricing-costs--availability--what-you-must-know-before-integrating).
+
+```yaml
+---
+name: implementation-agent
+description: Writes and edits production code for complex features
+effort: xhigh
+---
+
+You are a careful, thorough implementation agent...
+```
+
+```yaml
+---
+name: triage-agent
+description: Classifies incoming issues and routes them
+effort: low
+---
+
+You are a fast triage agent. Classify and route only...
+```
+
+**The override that silently wins over all of it:** the `CLAUDE_CODE_EFFORT_LEVEL` environment variable takes **maximum priority** — above any per-subagent frontmatter setting.
+
+```
+Priority for effort resolution (highest wins)
+──────────────────────────────────────────────────────────
+1 (wins)  CLAUDE_CODE_EFFORT_LEVEL env variable
+2 (loses) effort field in subagent frontmatter
+──────────────────────────────────────────────────────────
+```
+
+If `CLAUDE_CODE_EFFORT_LEVEL=low` is set globally — in a shell profile, CI environment, or container — every subagent runs at `low`, regardless of what its own frontmatter declares. A subagent explicitly configured with `effort: xhigh` for deep implementation work will silently run at `low` instead, with no warning. This is the same "layers of paint" pattern as model selection priority: check environment variables first when a subagent's behavior doesn't match its declared configuration.
+
+```bash
+# Check for a global override before debugging "why is my subagent shallow"
+echo $CLAUDE_CODE_EFFORT_LEVEL
+
+# Unset it to let subagent frontmatter take effect
+unset CLAUDE_CODE_EFFORT_LEVEL
+```
 
 ### The Enter vs `s` Key: Persistence Trap in claude.ai and Claude Desktop
 
@@ -1959,6 +2108,27 @@ claude --model claude-fable-5        # Explicitly request Fable 5
 print(response.model)                # May differ from requested model
 print(response.usage.input_tokens)   # Cost visibility: input
 print(response.usage.output_tokens)  # Cost visibility: output
+```
+
+```
+# output_config.effort levels (default = high)
+low      → minimal/no thinking, high-volume & triage
+medium   → thinking only when the task warrants it
+high     → thinks on nearly every request (default)
+xhigh    → always thinks, extended exploration — long-horizon coding
+max      → unrestricted reasoning — latency doesn't matter
+
+# Cost reality
+~7x spread between low and max on the same task
+~2.5x compound multiplier vs Opus 4.8 (1.3x tokenizer × 2x price)
+Thinking tokens billed regardless of `display` mode
+
+# Effort resolution priority in Claude Code (highest wins)
+1. CLAUDE_CODE_EFFORT_LEVEL env variable   ← overrides subagent frontmatter
+2. `effort` field in subagent frontmatter
+
+# Best metric for comparing effort levels
+cost_per_completed_task = cost_per_attempt / success_rate
 ```
 
 ```
