@@ -13,6 +13,7 @@
 5. [Claude Code + Claude Fable 5: The Ultimate Developer Workflow](#5-claude-code--claude-fable-5-the-ultimate-developer-workflow)
 6. [Model Comparison & Decision Framework: Fable 5 vs Previous Models](#6-model-comparison--decision-framework-fable-5-vs-previous-models)
 7. [Building Production-Ready Workflows with Claude Fable 5](#7-building-production-ready-workflows-with-claude-fable-5)
+8. [Glossary: The AI Engineer's Vocabulary](#8-glossary-the-ai-engineers-vocabulary)
 
 ---
 
@@ -3048,6 +3049,84 @@ Every claim dated and traceable to YOUR OWN canary evals.
 ```
 
 The discipline is the same one that runs through this entire guide: **trust what your own instrumentation shows on your own traffic, dated — not the launch-day bar chart.**
+
+---
+
+## 8. Glossary: The AI Engineer's Vocabulary
+
+Two layers of vocabulary. The first is the field-wide canon every AI engineer is expected to know cold. The second is the Fable-5-specific vocabulary this guide builds — each term links back to the section that explains it in depth.
+
+### Foundational AI & Machine Learning
+
+| Term | Definition |
+|---|---|
+| **Artificial Intelligence (AI)** | The broad field of building systems that perform tasks normally requiring human intelligence — learning, reasoning, problem-solving. |
+| **Machine Learning (ML)** | A subset of AI where systems learn patterns from historical data and improve accuracy without being explicitly programmed for each case. |
+| **Deep Learning (DL)** | A form of ML using multi-layered ("deep") neural networks to process unstructured data — text, images, audio. |
+| **Neural Network** | A computational structure loosely inspired by the brain: layers of weighted nodes that transform inputs into outputs, trained by adjusting the weights. |
+| **Backpropagation** | The training algorithm that computes how much each weight contributed to the error and updates it accordingly — the engine behind learning in neural networks. |
+| **Weights / Parameters** | The learned numerical values inside a model that encode what it "knows." Fable 5 and Mythos 5 share identical weights ([§2](#fable-5-vs-mythos-5-same-engine-different-gates)). |
+| **Supervised Fine-Tuning (SFT)** | Training a model further on curated input→output demonstrations to shape its behavior. |
+| **RLHF** | Reinforcement Learning from Human Feedback — a reward model scores outputs and the policy is updated to maximize that reward ([§2](#constitutional-ai--rlhf-the-safety-layer)). |
+| **Constitutional AI (CAI)** | Anthropic's technique where the model critiques and revises its own outputs against a written set of principles, reducing reliance on per-case human labeling ([§2](#constitutional-ai--rlhf-the-safety-layer)). |
+
+### Generative AI & Architecture
+
+| Term | Definition |
+|---|---|
+| **Large Language Model (LLM)** | A deep-learning model trained on vast text corpora to understand, summarize, and generate human-like language. |
+| **Transformer** | The neural-network architecture (Google, 2017) that uses **attention** to process the context of all tokens in parallel rather than sequentially — the foundation of modern LLMs ([§2](#the-transformer-foundation-and-what-changed)). |
+| **Attention Mechanism** | The component that lets a model weigh how much each token should influence every other token, capturing semantic context. |
+| **Token** | The basic unit of text a model processes — a word, sub-word, or character. Averages ~0.75 words. |
+| **Tokenizer** | The component that splits text into tokens. Fable 5 shares Opus 4.7/4.8's tokenizer but produces up to ~35% more tokens than pre-4.7 models for the same text ([§4](#the-real-cost-multiplier-tokenizer-delta)). |
+| **Embeddings** | Vector representations of tokens/data in a high-dimensional space where semantically similar items sit close together. |
+| **Multimodal AI** | Systems that process and/or generate multiple data types — text, images, audio, video ([§6](#multilingual-performance-gmmlu--include)). |
+| **Hallucination** | When a model generates confident but factually wrong or fabricated output, often from missing context. Distinct from a **refusal** (below). |
+| **Context Window** | The maximum tokens a model can hold in working memory in one interaction. Fable 5: **1M tokens**, shared across system prompt, tools, history, and output ([§2](#context-window-1-million-tokens-in-practice)). |
+
+### AI Engineering Practices
+
+| Term | Definition |
+|---|---|
+| **Inference** | Running a trained model on new inputs to generate predictions/outputs (as opposed to training). |
+| **Prompt Engineering** | Crafting model inputs to elicit accurate, useful responses ([§3](#3-advanced-prompting-techniques-for-claude-fable-5)). |
+| **Retrieval-Augmented Generation (RAG)** | Fetching external data at query time and feeding it to the LLM, giving access to proprietary/fresh information without changing the model weights. |
+| **Fine-Tuning** | Adapting a pre-trained model by training it further on a smaller, task-specific dataset. |
+| **Agentic AI** | Autonomous systems that plan multi-step action sequences, use tools (browsers, APIs), and adapt on feedback to reach a goal ([§2](#agentic-vs-assistant-the-fundamental-distinction)). |
+| **Tool Use / Function Calling** | The mechanism by which a model invokes external functions with structured arguments and incorporates the results ([§2](#tool-use-architecture)). |
+| **MCP (Model Context Protocol)** | An open protocol for connecting an agent to external data sources and tools ([§5](#mcp-servers-extending-claude-code)). |
+| **Benchmark** | A standardized task set used to measure model capability (SWE-bench, FrontierCode, GMMLU). Read critically — most are run on classifier-free models ([§6](#reading-benchmarks-critically-the-asterisk-behind-every-number)). |
+| **Canary Eval** | A small, fixed prompt set run on a schedule against a frozen rubric to detect model/routing drift over time ([§7](#detecting-drift-in-your-pipeline-the-canary-eval)). |
+
+### Infrastructure & Operations
+
+| Term | Definition |
+|---|---|
+| **LLMOps** | Lifecycle management, monitoring, versioning, and deployment of LLM-based applications. |
+| **Prompt Caching** | Storing a stable prompt prefix so repeat requests read it at **0.1×** instead of processing it at 1×. Fable 5 minimum: 512 tokens (1,024 on Bedrock) ([§4](#prompt-caching-the-01-read-and-the-512-token-minimum)). |
+| **Message Batches** | An async API that halves price ($5/$25 per M) for latency-tolerant workloads; stacks with caching ([§4](#message-batches-pay-half-for-latency-tolerant-work)). |
+| **Zero-Data-Retention (ZDR)** | An org configuration that prevents prompt/response storage. Conflicts with Fable 5's mandatory 30-day retention → HTTP 400 ([§4](#data-retention-requirement-the-silent-400-error)). |
+| **Covered Models** | Anthropic's classification (Fable 5, Mythos 5) for which the 30-day retention policy overrides any ZDR agreement ([§4](#the-30-day-policy-in-full-what-your-legal-team-will-ask)). |
+
+### Fable 5-Specific Vocabulary
+
+| Term | Definition |
+|---|---|
+| **Agentic vs. Assistant model** | Fable 5 executes multi-step work autonomously (agentic); older models step through a human-driven loop (assistant) ([§2](#agentic-vs-assistant-the-fundamental-distinction)). |
+| **Fallback** | Automatic, silent rerouting from Fable 5 to Opus 4.8 when a safety classifier triggers — returns HTTP 200, no error ([§4](#the-fallback-behavior-opus-48)). |
+| **Sticky Routing** | After a fallback, subsequent turns route to the fallback model for ~1 hour with no visible fallback block; only `usage.iterations` / `response.model` reveal it ([§5](#verifying-you-are-actually-running-claude-fable-5)). |
+| **Adaptive Thinking** | Fable 5's always-on internal reasoning — no off switch; `thinking: {type: "disabled"}` returns 400 ([§2](#adaptive-thinking-always-on-configurable-depth)). |
+| **Effort** (`output_config.effort`) | The throttle on *how much* the model reasons: `low → max`. The single biggest per-request cost lever; ~7× spread ([§2](#output-effort-controlling-how-much-fable-5-thinks)). |
+| **Display mode** | `omitted` vs `summarized` — controls what reasoning you *see*, not what you're billed (billing is identical) ([§4](#display-modes-visibility-vs-cost)). |
+| **Thinking tokens** | Internal-reasoning tokens, always billed as output regardless of display mode; read via `usage.output_tokens_details.thinking_tokens` ([§4](#reading-usage-to-understand-your-actual-fable-5-bill)). |
+| **Task Budget** (`task_budget`) | A session-wide token countdown the model *can* see and pace against (min 20,000; beta header required) ([§4](#spend-caps-four-layers-for-an-agent-with-no-ceiling)). |
+| **Refusal** | The model declines to answer: HTTP 200 + `stop_reason: "refusal"` + empty content. **Pre-output** = free; **mid-stream** = billed ([§5](#handling-refusals-and-false-positive-zones-in-production)). |
+| **Safety Classifier** | A separate AI model inspecting each request across four domains (cybersecurity, dual-use bio/chem, distillation/`frontier_llm`, `reasoning_extraction`) ([§2](#what-the-classifiers-actually-watch)). |
+| **Mythos 5** | The classifier-free variant — same weights/price/window as Fable 5 — available only via Project Glasswing ([§2](#fable-5-vs-mythos-5-same-engine-different-gates)). |
+| **Project Glasswing** | Anthropic's access program for Mythos 5; removes cybersecurity classifiers only ([§2](#project-glasswing-access-to-mythos-5)). |
+| **Server-Side Fallback** | A `fallbacks` parameter (up to 3 models) that lets the server retry on refusal in one request; beta header required ([§5](#three-fallback-routes-ordered-by-preference)). |
+| **Tokenizer Ratio** | `count_tokens(new) / count_tokens(old)` for the same payload — your real migration multiplier, measured not assumed ([§4](#measure-your-real-delta--dont-guess)). |
+| **Cost Per Completed Task** | `cost_per_attempt / success_rate` — the only honest cost metric, vs. price-per-token ([§4](#deciding-when-to-pay-the-fable-5-premium)). |
 
 ---
 
