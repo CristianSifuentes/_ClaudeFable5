@@ -275,6 +275,77 @@ This loop can repeat multiple times within one API call, enabling autonomous mul
 - **Multi-modal reasoning** — Enhanced image understanding integrated tighter with text reasoning chains.
 - **Native visual processing without plugins** — Fable 5 can interact with graphical interfaces, dashboards, and forms using only what it sees on screen. Where previous workflows required plugins or custom scrapers to pass UI state to the model, Fable 5 reads it directly. This simplifies any flow where the model must interpret visual data: charts, web interfaces, PDFs, screenshots.
 - **Token efficiency** — Fable 5 produces measurably better results while consuming approximately **half the tokens of Opus 4.8** for equivalent tasks. Think of it as a precision instrument: rather than disassembling the whole structure to find the problem, it places the exact beam needed.
+- **Thinking is always active** — Unlike Opus 4.8, where internal reasoning was an optional feature you toggled, Fable 5 reasons before every response without exception. You cannot disable it. You can only regulate its depth with `effort` and control its visibility with `display`.
+
+### Adaptive Thinking: Always On, Configurable Depth
+
+This is the architectural change responsible for the most broken integrations on launch day. Developers with working Opus 4.8 code started receiving HTTP 400 errors with no explanation — same request, same endpoint, different model, broken.
+
+```
+Opus 4.8 thinking model           Fable 5 thinking model
+───────────────────────────────    ───────────────────────────────
+Off by default                     Always on — no off switch
+You turn it on when needed         Already running when you arrive
+You allocate a token budget        Budget managed internally (adaptive)
+Sending thinking: disabled → ok    Sending thinking: disabled → HTTP 400
+```
+
+Think of it as an engine. In Opus 4.8, the engine started cold and you decided when to turn the key. In Fable 5, the engine is already running. You can control the RPMs with `effort`, and decide whether to see the exhaust with `display` — but you cannot turn the engine off.
+
+**Two safe migration paths from Opus 4.8:**
+
+```python
+# Option A: Omit the thinking field entirely (recommended)
+response = client.messages.create(
+    model="claude-fable-5",
+    max_tokens=8192,
+    messages=[{"role": "user", "content": prompt}]
+    # No thinking field — model uses adaptive defaults
+)
+
+# Option B: Explicit adaptive declaration
+response = client.messages.create(
+    model="claude-fable-5",
+    max_tokens=8192,
+    thinking={"type": "adaptive"},   # explicit but equivalent to omitting
+    messages=[{"role": "user", "content": prompt}]
+)
+```
+
+**What breaks from Opus 4.8 code:**
+
+```python
+# BREAKS — thinking: disabled is not valid in Fable 5
+response = client.messages.create(
+    model="claude-fable-5",
+    thinking={"type": "disabled"},   # → HTTP 400 immediately
+    ...
+)
+
+# BREAKS — manual token budget is not accepted
+response = client.messages.create(
+    model="claude-fable-5",
+    thinking={"type": "enabled", "budget_tokens": 5000},  # → HTTP 400
+    ...
+)
+```
+
+**The silent migration trap — `max_tokens` exhausted by reasoning:**
+
+Routes in Opus 4.8 that ran without thinking spent zero tokens on reasoning. The same request in Fable 5 consumes part of your `max_tokens` budget on internal reasoning before writing a single word of output.
+
+```
+Opus 4.8 classification request (max_tokens=256):
+  Thinking tokens:  0
+  Output tokens:   256 available for text
+
+Fable 5 classification request (max_tokens=256):
+  Thinking tokens:  ~200 (consumed before output starts)
+  Output tokens:    ~56 remaining for text
+  Result:           Truncated or empty response
+```
+
+If you have tasks where `max_tokens` was tuned tightly for Opus 4.8, audit them before migrating. Diagnose by reading `usage.output_tokens_details.thinking_tokens` — if it is consuming the majority of your allocated tokens, either raise `max_tokens` or lower `effort` for that route.
 
 ---
 
@@ -716,6 +787,74 @@ def validate_fable5_payload(payload: dict) -> list[str]:
 ```
 
 Run this validator against your existing request builders before switching `model` to `claude-fable-5`.
+
+### Display Modes: Visibility vs Cost
+
+The `display` parameter controls what you can see of the model's internal reasoning. It has no effect on what you are billed.
+
+```
+display mode    What you receive                    Streaming behavior
+─────────────────────────────────────────────────────────────────────────
+omitted         thinking field = empty string       No thinking deltas sent.
+(default)       Encrypted signature included        Text response starts
+                (required for multi-turn)           arriving immediately.
+
+summarized      Condensed readable reasoning        Summary arrives first.
+                Encrypted signature included        Text response starts
+                                                    after summary is complete.
+─────────────────────────────────────────────────────────────────────────
+```
+
+**The counterintuitive billing rule:** generating the summary is free. Billing is identical in both modes. `omitted` reduces latency (lower time-to-first-text-token); it does not reduce your bill.
+
+```
+When to use each:
+omitted     → Production. Faster time-to-first-text. Reasoning is internal.
+summarized  → Debugging sessions and UIs with an expandable reasoning drawer.
+              Never in high-volume production paths.
+```
+
+### Reading `usage` to Understand Your Actual Fable 5 Bill
+
+At $50/million output tokens, the difference between a well-tuned and a poorly-tuned Fable 5 integration can be substantial. The `usage` object gives you the data you need to tune.
+
+```python
+response = client.messages.create(
+    model="claude-fable-5",
+    max_tokens=4096,
+    messages=[{"role": "user", "content": prompt}]
+)
+
+u = response.usage
+
+# Total billed output tokens (thinking + text combined)
+print(f"Total output billed:  {u.output_tokens}")
+
+# Breakdown — requires output_tokens_details
+if hasattr(u, "output_tokens_details"):
+    thinking = u.output_tokens_details.thinking_tokens
+    text     = u.output_tokens - thinking
+    print(f"  Thinking tokens:    {thinking}   (${thinking / 1_000_000 * 50:.4f})")
+    print(f"  Text tokens:        {text}   (${text / 1_000_000 * 50:.4f})")
+
+# Input cost
+print(f"Input tokens:         {u.input_tokens}  (${u.input_tokens / 1_000_000 * 10:.4f})")
+```
+
+**Practical use:** if `thinking_tokens` is consuming 80%+ of your `output_tokens` budget on a simple classification route, that route should have its `effort` level lowered — or should be routed to Haiku 3.5 entirely.
+
+**What the raw chain of thought looks like — and what you never see:**
+
+```
+What you receive in any display mode:
+  thinking field:  "" (empty)  OR  "The user is asking about X..."  (summary)
+  + encrypted signature string (for multi-turn continuity)
+
+What you NEVER receive, under any configuration:
+  The actual internal reasoning tokens.
+  The full chain of thought is never exposed.
+  This is not configurable.
+```
 
 ### The Expensive Mistakes (and How to Avoid Them)
 
